@@ -594,10 +594,24 @@ class SuppressOutputFD:
             os.close(self._devnull_fd)
 
 
-def page_has_images(page) -> bool:
-    """Check if a page contains images (potential OCR candidates)."""
+def page_needs_ocr(page, min_text_chars: int = 50) -> bool:
+    """Check if a page likely needs OCR.
+
+    Returns True if:
+    - Page has embedded images, OR
+    - Page has very little extractable text (likely a scanned document)
+    """
+    # Check for embedded images
     image_list = page.get_images(full=False)
-    return len(image_list) > 0
+    if len(image_list) > 0:
+        return True
+
+    # Check if page has very little text (likely scanned)
+    text = page.get_text().strip()
+    if len(text) < min_text_chars:
+        return True
+
+    return False
 
 
 def extract_text_from_pdf(
@@ -660,7 +674,7 @@ def extract_text_from_pdf(
             with SuppressOutputFD(suppress=(hud is not None)):
                 text = page.get_text().strip()
 
-            if ocr_available and page_has_images(page):
+            if ocr_available and page_needs_ocr(page):
                 try:
                     if stats:
                         stats.current_status = f"OCR ({ocr_engine}) page {page_num}/{total_pages}..."
@@ -857,7 +871,7 @@ def process_pdf_worker(
             for page in doc:
                 text = page.get_text().strip()
 
-                if ocr_available and page_has_images(page):
+                if ocr_available and page_needs_ocr(page):
                     try:
                         if active_engine == "surya":
                             ocr_text = ocr_page_with_surya(page)
