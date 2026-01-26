@@ -1526,7 +1526,6 @@ def main() -> int:
 
     # Force CPU mode if requested (must be set before any CUDA imports)
     if args.cpu:
-        import os
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
     # Convert and validate path
