@@ -994,6 +994,11 @@ def extract_page_text(
 ) -> tuple[str, bool, int, str]:
     """Extract text from a single page, using OCR as appropriate.
 
+    Strategy:
+    - force_ocr: Full page OCR (re-OCR everything, ignore extracted text)
+    - has_images: Hybrid mode (extract text + OCR each image, merge by position)
+    - otherwise: Just extract text (fast, no OCR needed)
+
     Args:
         page: PyMuPDF page object
         ocr_engine: OCR engine to use ("surya", "paddle", "tesseract", "none")
@@ -1003,23 +1008,16 @@ def extract_page_text(
     Returns:
         Tuple of (text, used_ocr, ocr_chars, log_message)
     """
-    with SuppressOutputFD(suppress=suppress_output):
-        text = page.get_text().strip()
-
-    if ocr_engine == "none":
+    if ocr_engine == "none" and not force_ocr:
+        with SuppressOutputFD(suppress=suppress_output):
+            text = page.get_text().strip()
         return text, False, 0, ""
 
-    # Check if OCR is needed
     has_images = len(page.get_images(full=False)) > 0
-    has_text = len(text) > 100
-    needs_ocr = force_ocr or has_images or len(text) < 50
-
-    if not needs_ocr:
-        return text, False, 0, ""
 
     try:
-        if force_ocr or not has_text:
-            # Full page OCR: either forced, or page is mostly images/scanned
+        if force_ocr:
+            # Full page OCR: user wants everything re-OCR'd
             with SuppressOutputFD(suppress=suppress_output):
                 if ocr_engine == "surya":
                     ocr_text = ocr_page_with_surya(page)
@@ -1028,28 +1026,30 @@ def extract_page_text(
                 else:  # tesseract
                     tp = page.get_textpage_ocr(full=True, language="eng")
                     ocr_text = page.get_text(textpage=tp).strip()
+            return ocr_text, True, len(ocr_text), f"OCR +{len(ocr_text):,} chars ({ocr_engine})"
 
-            if len(ocr_text) > len(text):
-                return ocr_text, True, len(ocr_text), f"OCR +{len(ocr_text):,} chars ({ocr_engine})"
-            else:
-                return text, False, 0, f"kept original ({len(text):,} chars)"
-
-        elif has_images and has_text:
-            # Hybrid mode: extract text + OCR just the image regions
+        elif has_images:
+            # Hybrid: always extract text + OCR every image, merge by position
             with SuppressOutputFD(suppress=suppress_output):
                 hybrid_text, ocr_regions, ocr_chars = extract_page_hybrid(
                     page, ocr_engine=ocr_engine
                 )
-
             if ocr_regions > 0:
-                return hybrid_text, True, ocr_chars, f"Hybrid {ocr_regions} imgs (+{ocr_chars:,} chars)"
+                return hybrid_text, True, ocr_chars, f"+{ocr_regions} imgs (+{ocr_chars:,} chars)"
             else:
-                return text, False, 0, "Hybrid (no text in images)"
+                return hybrid_text, False, 0, ""
+
+        else:
+            # No images, just extract text
+            with SuppressOutputFD(suppress=suppress_output):
+                text = page.get_text().strip()
+            return text, False, 0, ""
 
     except Exception as e:
+        # Fallback to basic extraction on error
+        with SuppressOutputFD(suppress=suppress_output):
+            text = page.get_text().strip()
         return text, False, 0, f"FAILED - {e}"
-
-    return text, False, 0, ""
 
 
 class SuppressOutputFD:
@@ -1086,26 +1086,6 @@ class SuppressOutputFD:
             os.close(self._stdout_fd)
             os.close(self._stderr_fd)
             os.close(self._devnull_fd)
-
-
-def page_needs_ocr(page, min_text_chars: int = 50) -> bool:
-    """Check if a page likely needs OCR.
-
-    Returns True if:
-    - Page has embedded images, OR
-    - Page has very little extractable text (likely a scanned document)
-    """
-    # Check for embedded images
-    image_list = page.get_images(full=False)
-    if len(image_list) > 0:
-        return True
-
-    # Check if page has very little text (likely scanned)
-    text = page.get_text().strip()
-    if len(text) < min_text_chars:
-        return True
-
-    return False
 
 
 def extract_text_from_pdf(
