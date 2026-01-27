@@ -30,6 +30,718 @@ class QualityMetrics:
     word_count: int = 0
 
 
+@dataclass
+class ImageFeature:
+    """Features extracted from an image region for learning."""
+    # Geometric features
+    width: int
+    height: int
+    area: int
+    aspect_ratio: float
+
+    # Position features (normalized to page dimensions)
+    page_y_center: float  # 0-1, top to bottom
+    region: str  # "header", "body", "footer", "margin"
+
+    # Context features
+    surrounding_text_density: float  # chars per 100px around image
+    has_nearby_caption: bool
+
+    # Visual features
+    brightness_mean: float  # 0-255
+    brightness_std: float  # contrast indicator
+    is_mostly_white: bool  # >95% pixels above 240
+    has_contrast: bool  # std > 30
+
+    def to_vector(self) -> list[float]:
+        """Convert to numeric vector for clustering."""
+        return [
+            self.width / 1000,  # Normalize to ~0-2 range
+            self.height / 1000,
+            self.area / 1_000_000,
+            self.aspect_ratio,
+            self.page_y_center,
+            {"header": 0.0, "body": 0.5, "footer": 1.0, "margin": 0.25}.get(self.region, 0.5),
+            self.surrounding_text_density / 100,
+            1.0 if self.has_nearby_caption else 0.0,
+            self.brightness_mean / 255,
+            self.brightness_std / 128,
+            1.0 if self.is_mostly_white else 0.0,
+            1.0 if self.has_contrast else 0.0,
+        ]
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for storage."""
+        return {
+            "width": self.width,
+            "height": self.height,
+            "area": self.area,
+            "aspect_ratio": self.aspect_ratio,
+            "page_y_center": self.page_y_center,
+            "region": self.region,
+            "surrounding_text_density": self.surrounding_text_density,
+            "has_nearby_caption": self.has_nearby_caption,
+            "brightness_mean": self.brightness_mean,
+            "brightness_std": self.brightness_std,
+            "is_mostly_white": self.is_mostly_white,
+            "has_contrast": self.has_contrast,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ImageFeature":
+        """Create from dictionary."""
+        return cls(**d)
+
+
+@dataclass
+class OCROutcome:
+    """Record of an OCR attempt with features and results."""
+    timestamp: float
+    pdf_path: str
+    page_num: int
+    image_index: int
+    features: ImageFeature
+    ocr_performed: bool
+    text_length: int
+    word_count: int
+    is_useful: bool  # text_length > 10 and word_count >= 2
+    cluster_id: int = -1  # Assigned cluster (-1 = not yet clustered)
+
+
+@dataclass
+class ClusterStats:
+    """Aggregated statistics for a feature cluster."""
+    cluster_id: int
+    sample_count: int
+    useful_count: int
+    # Beta distribution parameters for Bayesian updating
+    alpha: float  # Prior + successes
+    beta: float  # Prior + failures
+    # Decay-weighted recent stats
+    recent_useful_rate: float
+    last_updated: float
+
+    def usefulness_probability(self) -> float:
+        """Expected probability that OCR will be useful for this cluster."""
+        return self.alpha / (self.alpha + self.beta)
+
+    def confidence(self) -> float:
+        """Confidence in the estimate (0-1 based on sample count)."""
+        return min(1.0, self.sample_count / 50)  # Full confidence at 50 samples
+
+    def thompson_sample(self) -> float:
+        """Thompson sampling: draw from Beta distribution for exploration."""
+        import random
+        return random.betavariate(self.alpha, self.beta)
+
+
+class AdaptiveLearner:
+    """Adaptive OCR learning system using feature-based clustering.
+
+    Learns which image types are worth OCR'ing based on:
+    - Image features (size, position, brightness, etc.)
+    - K-means clustering to group similar images
+    - Bayesian updating with Beta distribution per cluster
+    - Thompson sampling for exploration/exploitation balance
+    """
+
+    DEFAULT_DB_PATH = Path.home() / ".pdf2txt" / "learning.db"
+    NUM_CLUSTERS = 12
+    MIN_SAMPLES_FOR_PREDICTION = 20
+    MIN_SAMPLES_PER_CLUSTER = 10
+    EXPLORATION_RATE = 0.10  # Always OCR 10% for learning
+    SKIP_CONFIDENCE_THRESHOLD = 0.60
+    SKIP_USEFULNESS_THRESHOLD = 0.10
+
+    def __init__(self, db_path: Path | None = None, enabled: bool = True):
+        self.db_path = db_path or self.DEFAULT_DB_PATH
+        self.enabled = enabled
+        self._conn = None
+        self._cluster_centers: list[list[float]] | None = None
+        self._cluster_stats: dict[int, ClusterStats] = {}
+        self._stats = {
+            "images_seen": 0,
+            "images_skipped": 0,
+            "images_ocrd": 0,
+            "ocr_useful": 0,       # OCR'd and found useful text
+            "ocr_empty": 0,        # OCR'd but no useful text (wasted effort)
+            "exploration_ocrs": 0,
+            "exploration_useful": 0,  # Exploration found useful text (would've been bad skip)
+            "exploration_empty": 0,   # Exploration found nothing (confirms skip OK)
+        }
+
+        if self.enabled:
+            self._init_db()
+            self._load_cluster_stats()
+
+    def _init_db(self):
+        """Initialize SQLite database with required tables."""
+        import sqlite3
+
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS ocr_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                pdf_path TEXT NOT NULL,
+                page_num INTEGER NOT NULL,
+                image_index INTEGER NOT NULL,
+                -- Features (stored individually for querying)
+                width INTEGER,
+                height INTEGER,
+                area INTEGER,
+                aspect_ratio REAL,
+                page_y_center REAL,
+                region TEXT,
+                surrounding_text_density REAL,
+                has_nearby_caption INTEGER,
+                brightness_mean REAL,
+                brightness_std REAL,
+                is_mostly_white INTEGER,
+                has_contrast INTEGER,
+                -- Outcomes
+                ocr_performed INTEGER NOT NULL,
+                text_length INTEGER,
+                word_count INTEGER,
+                is_useful INTEGER,
+                cluster_id INTEGER DEFAULT -1,
+                -- Index for cleanup
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ocr_outcomes_timestamp ON ocr_outcomes(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_ocr_outcomes_cluster ON ocr_outcomes(cluster_id);
+
+            CREATE TABLE IF NOT EXISTS cluster_stats (
+                cluster_id INTEGER PRIMARY KEY,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                useful_count INTEGER NOT NULL DEFAULT 0,
+                alpha REAL NOT NULL DEFAULT 1.0,
+                beta REAL NOT NULL DEFAULT 1.0,
+                recent_useful_rate REAL NOT NULL DEFAULT 0.5,
+                last_updated REAL NOT NULL,
+                center_vector TEXT  -- JSON array of cluster center
+            );
+
+            CREATE TABLE IF NOT EXISTS learning_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+
+            -- Track processed files by content hash to avoid reprocessing
+            CREATE TABLE IF NOT EXISTS processed_files (
+                file_hash TEXT PRIMARY KEY,
+                pdf_path TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                page_count INTEGER NOT NULL,
+                image_count INTEGER NOT NULL,
+                processed_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_processed_files_path ON processed_files(pdf_path);
+        """)
+        self._conn.commit()
+
+    def _load_cluster_stats(self):
+        """Load cluster statistics from database."""
+        if not self._conn:
+            return
+
+        cursor = self._conn.execute("SELECT * FROM cluster_stats")
+        for row in cursor:
+            self._cluster_stats[row["cluster_id"]] = ClusterStats(
+                cluster_id=row["cluster_id"],
+                sample_count=row["sample_count"],
+                useful_count=row["useful_count"],
+                alpha=row["alpha"],
+                beta=row["beta"],
+                recent_useful_rate=row["recent_useful_rate"],
+                last_updated=row["last_updated"],
+            )
+
+        # Load cluster centers if available
+        import json
+        cursor = self._conn.execute(
+            "SELECT value FROM learning_meta WHERE key = 'cluster_centers'"
+        )
+        row = cursor.fetchone()
+        if row:
+            self._cluster_centers = json.loads(row["value"])
+
+    def _save_cluster_stats(self, stats: ClusterStats):
+        """Save cluster statistics to database."""
+        if not self._conn:
+            return
+
+        self._conn.execute("""
+            INSERT OR REPLACE INTO cluster_stats
+            (cluster_id, sample_count, useful_count, alpha, beta, recent_useful_rate, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            stats.cluster_id,
+            stats.sample_count,
+            stats.useful_count,
+            stats.alpha,
+            stats.beta,
+            stats.recent_useful_rate,
+            stats.last_updated,
+        ))
+        self._conn.commit()
+
+    def _find_nearest_cluster(self, feature_vector: list[float]) -> int:
+        """Find the nearest cluster for a feature vector."""
+        if not self._cluster_centers:
+            return -1
+
+        min_dist = float("inf")
+        nearest = -1
+        for i, center in enumerate(self._cluster_centers):
+            dist = sum((a - b) ** 2 for a, b in zip(feature_vector, center))
+            if dist < min_dist:
+                min_dist = dist
+                nearest = i
+        return nearest
+
+    def should_ocr(self, features: ImageFeature) -> tuple[bool, str, bool]:
+        """Decide whether to OCR this image.
+
+        Returns:
+            Tuple of (should_ocr, reason, is_exploration)
+        """
+        if not self.enabled:
+            return True, "learning disabled", False
+
+        self._stats["images_seen"] += 1
+        feature_vector = features.to_vector()
+
+        # Exploration: always OCR some images to keep learning
+        import random
+        if random.random() < self.EXPLORATION_RATE:
+            self._stats["exploration_ocrs"] += 1
+            return True, "exploration", True
+
+        # Not enough data yet - use heuristics
+        total_samples = sum(s.sample_count for s in self._cluster_stats.values())
+        if total_samples < self.MIN_SAMPLES_FOR_PREDICTION:
+            should, reason = self._heuristic_decision(features)
+            return should, reason, False
+
+        # Find cluster
+        cluster_id = self._find_nearest_cluster(feature_vector)
+        if cluster_id < 0 or cluster_id not in self._cluster_stats:
+            should, reason = self._heuristic_decision(features)
+            return should, reason, False
+
+        stats = self._cluster_stats[cluster_id]
+        if stats.sample_count < self.MIN_SAMPLES_PER_CLUSTER:
+            return True, f"cluster {cluster_id} needs more samples", False
+
+        # Use Thompson sampling for exploration/exploitation
+        sampled_usefulness = stats.thompson_sample()
+        confidence = stats.confidence()
+
+        # Only skip if confident AND predicted usefulness is very low
+        if confidence > self.SKIP_CONFIDENCE_THRESHOLD and sampled_usefulness < self.SKIP_USEFULNESS_THRESHOLD:
+            self._stats["images_skipped"] += 1
+            return False, f"cluster {cluster_id}: {sampled_usefulness:.1%} useful (conf: {confidence:.1%})", False
+
+        self._stats["images_ocrd"] += 1
+        return True, f"cluster {cluster_id}: {sampled_usefulness:.1%} useful", False
+
+    def _heuristic_decision(self, features: ImageFeature) -> tuple[bool, str]:
+        """Fallback heuristics when not enough learning data."""
+        # Skip tiny images (likely icons/bullets)
+        if features.area < 400:  # 20x20
+            self._stats["images_skipped"] += 1
+            return False, "heuristic: tiny image"
+
+        # Skip mostly-white images with no contrast (likely blank/whitespace)
+        if features.is_mostly_white and not features.has_contrast:
+            self._stats["images_skipped"] += 1
+            return False, "heuristic: blank/white"
+
+        # Skip margin decorations (narrow aspect ratio in margins)
+        if features.region == "margin" and (features.aspect_ratio > 5 or features.aspect_ratio < 0.2):
+            self._stats["images_skipped"] += 1
+            return False, "heuristic: margin decoration"
+
+        self._stats["images_ocrd"] += 1
+        return True, "heuristic: worth trying"
+
+    def record_outcome(
+        self,
+        features: ImageFeature,
+        pdf_path: str,
+        page_num: int,
+        image_index: int,
+        ocr_performed: bool,
+        text: str,
+        is_exploration: bool = False,
+    ):
+        """Record the outcome of an OCR decision."""
+        if not self.enabled or not self._conn:
+            return
+
+        text_length = len(text) if text else 0
+        word_count = len(text.split()) if text else 0
+        is_useful = text_length > 10 and word_count >= 2
+
+        # Track accuracy metrics
+        if ocr_performed:
+            if is_useful:
+                self._stats["ocr_useful"] += 1
+            else:
+                self._stats["ocr_empty"] += 1
+
+            # Track exploration accuracy separately
+            if is_exploration:
+                if is_useful:
+                    self._stats["exploration_useful"] += 1  # Would've been bad to skip
+                else:
+                    self._stats["exploration_empty"] += 1   # Confirms skipping is OK
+
+        feature_vector = features.to_vector()
+        cluster_id = self._find_nearest_cluster(feature_vector) if self._cluster_centers else -1
+
+        # Insert outcome record
+        self._conn.execute("""
+            INSERT INTO ocr_outcomes (
+                timestamp, pdf_path, page_num, image_index,
+                width, height, area, aspect_ratio, page_y_center, region,
+                surrounding_text_density, has_nearby_caption,
+                brightness_mean, brightness_std, is_mostly_white, has_contrast,
+                ocr_performed, text_length, word_count, is_useful, cluster_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            time.time(), pdf_path, page_num, image_index,
+            features.width, features.height, features.area, features.aspect_ratio,
+            features.page_y_center, features.region,
+            features.surrounding_text_density, int(features.has_nearby_caption),
+            features.brightness_mean, features.brightness_std,
+            int(features.is_mostly_white), int(features.has_contrast),
+            int(ocr_performed), text_length, word_count, int(is_useful), cluster_id,
+        ))
+        self._conn.commit()
+
+        # Update cluster stats if we have clusters and OCR was performed
+        if ocr_performed and cluster_id >= 0:
+            self._update_cluster_stats(cluster_id, is_useful)
+
+    def _update_cluster_stats(self, cluster_id: int, is_useful: bool):
+        """Update statistics for a cluster with Bayesian updating."""
+        if cluster_id not in self._cluster_stats:
+            self._cluster_stats[cluster_id] = ClusterStats(
+                cluster_id=cluster_id,
+                sample_count=0,
+                useful_count=0,
+                alpha=1.0,  # Prior: assume 50% useful
+                beta=1.0,
+                recent_useful_rate=0.5,
+                last_updated=time.time(),
+            )
+
+        stats = self._cluster_stats[cluster_id]
+        stats.sample_count += 1
+        if is_useful:
+            stats.useful_count += 1
+            stats.alpha += 1
+        else:
+            stats.beta += 1
+
+        # Exponential decay for recent rate (weight recent more heavily)
+        decay = 0.95
+        stats.recent_useful_rate = decay * stats.recent_useful_rate + (1 - decay) * (1.0 if is_useful else 0.0)
+        stats.last_updated = time.time()
+
+        self._save_cluster_stats(stats)
+
+    def recluster(self, force: bool = False):
+        """Re-run K-means clustering on all outcomes.
+
+        Called periodically to update cluster assignments.
+        """
+        if not self.enabled or not self._conn:
+            return
+
+        # Get all feature vectors
+        cursor = self._conn.execute("""
+            SELECT id, width, height, area, aspect_ratio, page_y_center, region,
+                   surrounding_text_density, has_nearby_caption,
+                   brightness_mean, brightness_std, is_mostly_white, has_contrast,
+                   is_useful
+            FROM ocr_outcomes
+            WHERE ocr_performed = 1
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (self.MAX_RECORDS,))
+
+        rows = cursor.fetchall()
+        if len(rows) < self.NUM_CLUSTERS * 2:
+            return  # Not enough data for meaningful clustering
+
+        # Build feature matrix
+        import json
+        vectors = []
+        ids = []
+        outcomes = []
+        for row in rows:
+            features = ImageFeature(
+                width=row["width"],
+                height=row["height"],
+                area=row["area"],
+                aspect_ratio=row["aspect_ratio"],
+                page_y_center=row["page_y_center"],
+                region=row["region"],
+                surrounding_text_density=row["surrounding_text_density"],
+                has_nearby_caption=bool(row["has_nearby_caption"]),
+                brightness_mean=row["brightness_mean"],
+                brightness_std=row["brightness_std"],
+                is_mostly_white=bool(row["is_mostly_white"]),
+                has_contrast=bool(row["has_contrast"]),
+            )
+            vectors.append(features.to_vector())
+            ids.append(row["id"])
+            outcomes.append(bool(row["is_useful"]))
+
+        # Simple K-means implementation (avoid sklearn dependency)
+        centers, assignments = self._kmeans(vectors, self.NUM_CLUSTERS)
+
+        # Update cluster assignments in database
+        for record_id, cluster_id in zip(ids, assignments):
+            self._conn.execute(
+                "UPDATE ocr_outcomes SET cluster_id = ? WHERE id = ?",
+                (cluster_id, record_id)
+            )
+
+        # Rebuild cluster stats from assignments
+        self._cluster_stats.clear()
+        for cluster_id, is_useful in zip(assignments, outcomes):
+            if cluster_id not in self._cluster_stats:
+                self._cluster_stats[cluster_id] = ClusterStats(
+                    cluster_id=cluster_id,
+                    sample_count=0,
+                    useful_count=0,
+                    alpha=1.0,
+                    beta=1.0,
+                    recent_useful_rate=0.5,
+                    last_updated=time.time(),
+                )
+            stats = self._cluster_stats[cluster_id]
+            stats.sample_count += 1
+            if is_useful:
+                stats.useful_count += 1
+                stats.alpha += 1
+            else:
+                stats.beta += 1
+
+        # Save cluster centers
+        self._cluster_centers = centers
+        self._conn.execute(
+            "INSERT OR REPLACE INTO learning_meta (key, value) VALUES (?, ?)",
+            ("cluster_centers", json.dumps(centers))
+        )
+
+        # Save all cluster stats
+        for stats in self._cluster_stats.values():
+            stats.recent_useful_rate = stats.useful_count / max(stats.sample_count, 1)
+            self._save_cluster_stats(stats)
+
+        self._conn.commit()
+
+    def _kmeans(self, vectors: list[list[float]], k: int, max_iter: int = 100) -> tuple[list[list[float]], list[int]]:
+        """Simple K-means clustering implementation."""
+        import random
+
+        if not vectors:
+            return [], []
+
+        n_features = len(vectors[0])
+
+        # Initialize centers randomly from data points
+        centers = random.sample(vectors, min(k, len(vectors)))
+        while len(centers) < k:
+            centers.append([random.random() for _ in range(n_features)])
+
+        assignments = [-1] * len(vectors)
+
+        for _ in range(max_iter):
+            # Assign points to nearest center
+            new_assignments = []
+            for vec in vectors:
+                min_dist = float("inf")
+                nearest = 0
+                for i, center in enumerate(centers):
+                    dist = sum((a - b) ** 2 for a, b in zip(vec, center))
+                    if dist < min_dist:
+                        min_dist = dist
+                        nearest = i
+                new_assignments.append(nearest)
+
+            # Check for convergence
+            if new_assignments == assignments:
+                break
+            assignments = new_assignments
+
+            # Update centers
+            new_centers = [[0.0] * n_features for _ in range(k)]
+            counts = [0] * k
+            for vec, cluster_id in zip(vectors, assignments):
+                for j, val in enumerate(vec):
+                    new_centers[cluster_id][j] += val
+                counts[cluster_id] += 1
+
+            for i in range(k):
+                if counts[i] > 0:
+                    new_centers[i] = [v / counts[i] for v in new_centers[i]]
+                else:
+                    new_centers[i] = centers[i]  # Keep old center if empty
+            centers = new_centers
+
+        return centers, assignments
+
+    @staticmethod
+    def compute_file_hash(pdf_path: Path) -> str:
+        """Compute MD5 hash of a PDF file for deduplication."""
+        import hashlib
+        hasher = hashlib.md5()
+        with open(pdf_path, "rb") as f:
+            # Read in chunks for memory efficiency
+            for chunk in iter(lambda: f.read(65536), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def is_file_processed(self, pdf_path: Path) -> bool:
+        """Check if a file has already been processed (by content hash)."""
+        if not self.enabled or not self._conn:
+            return False
+
+        file_hash = self.compute_file_hash(pdf_path)
+        cursor = self._conn.execute(
+            "SELECT file_hash FROM processed_files WHERE file_hash = ?",
+            (file_hash,)
+        )
+        exists = cursor.fetchone() is not None
+
+        if exists:
+            # Update last_seen_at timestamp
+            self._conn.execute(
+                "UPDATE processed_files SET last_seen_at = ?, pdf_path = ? WHERE file_hash = ?",
+                (time.time(), str(pdf_path), file_hash)
+            )
+            self._conn.commit()
+
+        return exists
+
+    def record_file_processed(
+        self,
+        pdf_path: Path,
+        page_count: int,
+        image_count: int,
+    ):
+        """Record that a file has been processed."""
+        if not self.enabled or not self._conn:
+            return
+
+        file_hash = self.compute_file_hash(pdf_path)
+        file_size = pdf_path.stat().st_size
+        now = time.time()
+
+        self._conn.execute("""
+            INSERT OR REPLACE INTO processed_files
+            (file_hash, pdf_path, file_size, page_count, image_count, processed_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (file_hash, str(pdf_path), file_size, page_count, image_count, now, now))
+        self._conn.commit()
+
+    def get_stats(self) -> dict:
+        """Get learning statistics for display."""
+        if not self.enabled or not self._conn:
+            return {"enabled": False}
+
+        cursor = self._conn.execute("SELECT COUNT(*) as total FROM ocr_outcomes")
+        total_records = cursor.fetchone()["total"]
+
+        cursor = self._conn.execute(
+            "SELECT COUNT(*) as useful FROM ocr_outcomes WHERE is_useful = 1 AND ocr_performed = 1"
+        )
+        useful_records = cursor.fetchone()["useful"]
+
+        cursor = self._conn.execute(
+            "SELECT COUNT(*) as ocrd FROM ocr_outcomes WHERE ocr_performed = 1"
+        )
+        ocrd_records = cursor.fetchone()["ocrd"]
+
+        cluster_info = []
+        for stats in sorted(self._cluster_stats.values(), key=lambda s: s.cluster_id):
+            cluster_info.append({
+                "id": stats.cluster_id,
+                "samples": stats.sample_count,
+                "useful_rate": stats.usefulness_probability(),
+                "confidence": stats.confidence(),
+            })
+
+        # Get processed files stats
+        cursor = self._conn.execute("SELECT COUNT(*) as count FROM processed_files")
+        processed_files_count = cursor.fetchone()["count"]
+
+        cursor = self._conn.execute(
+            "SELECT SUM(page_count) as pages, SUM(image_count) as images FROM processed_files"
+        )
+        row = cursor.fetchone()
+        total_pages = row["pages"] or 0
+        total_images = row["images"] or 0
+
+        return {
+            "enabled": True,
+            "db_path": str(self.db_path),
+            "total_records": total_records,
+            "ocrd_records": ocrd_records,
+            "useful_records": useful_records,
+            "overall_useful_rate": useful_records / max(ocrd_records, 1),
+            "num_clusters": len(self._cluster_stats),
+            "clusters": cluster_info,
+            "session_stats": self._stats.copy(),
+            "processed_files": processed_files_count,
+            "total_pages_processed": total_pages,
+            "total_images_seen": total_images,
+        }
+
+    def reset(self):
+        """Reset the learning database."""
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+        self._cluster_centers = None
+        self._cluster_stats.clear()
+        self._stats = {
+            "images_seen": 0,
+            "images_skipped": 0,
+            "images_ocrd": 0,
+            "ocr_useful": 0,
+            "ocr_empty": 0,
+            "exploration_ocrs": 0,
+            "exploration_useful": 0,
+            "exploration_empty": 0,
+        }
+
+        if self.enabled:
+            self._init_db()
+
+    def close(self):
+        """Close database connection."""
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+
 class TextQualityScorer:
     """Score text quality for comparison between extractions."""
 
@@ -221,8 +933,9 @@ class FileResult:
 class RetroHUD:
     """80's style terminal HUD using curses."""
 
-    def __init__(self, stats: ProcessingStats):
+    def __init__(self, stats: ProcessingStats, learner: "AdaptiveLearner | None" = None):
         self.stats = stats
+        self.learner = learner
         self.stdscr = None
 
     def __enter__(self):
@@ -402,9 +1115,10 @@ class RetroHUD:
                 status = self.stats.current_status[:30] if self.stats.current_status else "Ready"
                 self.draw_stat(y, 48, "STATUS: ", status)
 
-            # Results box
+            # Results box (taller if learning enabled)
             y_offset += box_height + 1
-            results_height = 6
+            has_learning = self.learner and self.learner.enabled
+            results_height = 10 if has_learning else 6
             if y_offset + results_height < height:
                 self.draw_box(y_offset, 0, results_height, min(width - 1, 78), "RESULTS")
                 y = y_offset + 1
@@ -419,9 +1133,40 @@ class RetroHUD:
                     self.draw_stat(y, 2, "IMPROVED: ", f"{self.stats.improved_files:4d}")
                     self.draw_stat(y, 22, "KEPT: ", f"{self.stats.kept_existing:4d}")
 
-                y += 2
+                y += 1
                 total_pages = self.stats.processed_pages
                 self.draw_stat(y, 2, "TOTAL PAGES: ", f"{total_pages:,}")
+
+                # Learning stats
+                if has_learning:
+                    y += 1
+                    self.stdscr.addstr(y, 2, "─" * 30, curses.color_pair(2))
+                    self.stdscr.addstr(y, 34, " LEARNING ", curses.color_pair(1) | curses.A_BOLD)
+                    self.stdscr.addstr(y, 44, "─" * 30, curses.color_pair(2))
+
+                    y += 1
+                    ls = self.learner._stats
+                    self.draw_stat(y, 2, "IMAGES: ", f"{ls['images_seen']:4d}")
+                    self.draw_stat(y, 18, "OCR'd: ", f"{ls['images_ocrd']:4d}")
+                    self.draw_stat(y, 34, "SKIPPED: ", f"{ls['images_skipped']:4d}")
+
+                    # OCR efficiency: what % of OCRs found useful text
+                    total_ocrd = ls['ocr_useful'] + ls['ocr_empty']
+                    if total_ocrd > 0:
+                        ocr_eff = ls['ocr_useful'] / total_ocrd * 100
+                        self.draw_stat(y, 52, "OCR EFF: ", f"{ocr_eff:4.1f}%")
+
+                    # Second row: exploration accuracy
+                    y += 1
+                    exp_total = ls['exploration_useful'] + ls['exploration_empty']
+                    if exp_total > 0:
+                        # Miss rate: exploration found useful text we would've skipped
+                        miss_rate = ls['exploration_useful'] / exp_total * 100
+                        self.draw_stat(y, 2, "EXPLORE: ", f"{exp_total:4d}")
+                        self.draw_stat(y, 18, "WOULD MISS: ", f"{ls['exploration_useful']:3d}")
+                        # Color code: green if low miss rate, red if high
+                        miss_color = curses.color_pair(4) if miss_rate > 20 else curses.color_pair(1)
+                        self.stdscr.addstr(y, 48, f"MISS RATE: {miss_rate:4.1f}%", miss_color | curses.A_BOLD)
 
             # Log box
             y_offset += results_height + 1
@@ -867,7 +1612,115 @@ def ocr_page_with_surya(page, dpi: int = 300) -> str:
     return '\n'.join(lines)
 
 
-def ocr_image_region(page, bbox, ocr_engine: str = "surya", dpi: int = 300) -> str:
+def extract_image_features(
+    page,
+    bbox: tuple[float, float, float, float],
+    img,
+    text_blocks: list | None = None,
+) -> ImageFeature:
+    """Extract features from an image region for learning.
+
+    Args:
+        page: PyMuPDF page object
+        bbox: (x0, y0, x1, y1) bounding box in page coordinates
+        img: PIL Image of the region
+        text_blocks: List of text blocks from page.get_text("blocks") for context
+
+    Returns:
+        ImageFeature with all extracted characteristics
+    """
+    import numpy as np
+
+    x0, y0, x1, y1 = bbox
+    page_rect = page.rect
+    page_height = page_rect.height
+    page_width = page_rect.width
+
+    # Geometric features
+    width = int(x1 - x0)
+    height = int(y1 - y0)
+    area = width * height
+    aspect_ratio = width / max(height, 1)
+
+    # Position features
+    y_center = (y0 + y1) / 2
+    page_y_center = y_center / max(page_height, 1)
+
+    # Determine region (header/body/footer/margin)
+    x_center = (x0 + x1) / 2
+    if page_y_center < 0.12:
+        region = "header"
+    elif page_y_center > 0.88:
+        region = "footer"
+    elif x_center < page_width * 0.1 or x_center > page_width * 0.9:
+        region = "margin"
+    else:
+        region = "body"
+
+    # Context features - surrounding text density
+    surrounding_text_density = 0.0
+    has_nearby_caption = False
+
+    if text_blocks:
+        # Count text chars within 50 page units of this image
+        search_margin = 50
+        text_chars_nearby = 0
+        for block in text_blocks:
+            bx0, by0, bx1, by1, content, _, block_type = block
+            if block_type != 0:  # Skip non-text blocks
+                continue
+            # Check if block is near the image
+            if (bx0 < x1 + search_margin and bx1 > x0 - search_margin and
+                by0 < y1 + search_margin and by1 > y0 - search_margin):
+                text_chars_nearby += len(str(content))
+                # Check for caption-like text below image
+                if by0 > y1 and by0 < y1 + 30 and len(str(content)) < 200:
+                    content_lower = str(content).lower()
+                    if any(kw in content_lower for kw in ["figure", "fig.", "image", "photo", "chart", "table"]):
+                        has_nearby_caption = True
+        # Normalize: chars per 100 pixels of search area
+        search_area = (x1 - x0 + 2 * search_margin) * (y1 - y0 + 2 * search_margin)
+        surrounding_text_density = (text_chars_nearby / max(search_area, 1)) * 10000
+
+    # Visual features from the image
+    if img.mode != 'L':
+        gray = img.convert('L')
+    else:
+        gray = img
+    pixels = np.array(gray)
+
+    brightness_mean = float(np.mean(pixels))
+    brightness_std = float(np.std(pixels))
+    is_mostly_white = float(np.mean(pixels > 240)) > 0.95
+    has_contrast = brightness_std > 30
+
+    return ImageFeature(
+        width=width,
+        height=height,
+        area=area,
+        aspect_ratio=aspect_ratio,
+        page_y_center=page_y_center,
+        region=region,
+        surrounding_text_density=surrounding_text_density,
+        has_nearby_caption=has_nearby_caption,
+        brightness_mean=brightness_mean,
+        brightness_std=brightness_std,
+        is_mostly_white=is_mostly_white,
+        has_contrast=has_contrast,
+    )
+
+
+def ocr_image_region(
+    page,
+    bbox,
+    ocr_engine: str = "surya",
+    dpi: int = 300,
+    learner: AdaptiveLearner | None = None,
+    pdf_path: str = "",
+    page_num: int = 0,
+    image_index: int = 0,
+    text_blocks: list | None = None,
+) -> tuple[str, bool]:
     """OCR a specific region of a page.
 
     Args:
@@ -875,9 +1728,14 @@ def ocr_image_region(page, bbox, ocr_engine: str = "surya", dpi: int = 300) -> s
         bbox: Tuple of (x0, y0, x1, y1) defining the region
         ocr_engine: "surya", "paddle", or "tesseract"
         dpi: Resolution for rendering
+        learner: Optional AdaptiveLearner for skip decisions
+        pdf_path: PDF file path for logging
+        page_num: Page number for logging
+        image_index: Image index on page for logging
+        text_blocks: Text blocks for context analysis
 
     Returns:
-        Extracted text from the region
+        Tuple of (extracted_text, was_ocr_performed)
     """
     import io
     from PIL import Image
@@ -894,15 +1752,27 @@ def ocr_image_region(page, bbox, ocr_engine: str = "surya", dpi: int = 300) -> s
 
     # Skip tiny images (likely decorative)
     if img.width < 20 or img.height < 10:
-        return ""
+        return "", False
 
+    # Extract features for learning
+    features = None
+    is_exploration = False
+    if learner:
+        features = extract_image_features(page, bbox, img, text_blocks)
+        do_ocr, reason, is_exploration = learner.should_ocr(features)
+        if not do_ocr:
+            # Record that we skipped this image (no OCR, no text)
+            learner.record_outcome(features, pdf_path, page_num, image_index, False, "")
+            return "", False
+
+    # Perform OCR
+    text = ""
     if ocr_engine == "surya":
         models = get_surya_ocr()
         rec_results = models['recognition']([img], det_predictor=models['detection'])
-        if not rec_results or not rec_results[0]:
-            return ""
-        lines = [tl.text for tl in rec_results[0].text_lines if tl.text]
-        return '\n'.join(lines)
+        if rec_results and rec_results[0]:
+            lines = [tl.text for tl in rec_results[0].text_lines if tl.text]
+            text = '\n'.join(lines)
 
     elif ocr_engine == "paddle":
         import numpy as np
@@ -912,27 +1782,38 @@ def ocr_image_region(page, bbox, ocr_engine: str = "surya", dpi: int = 300) -> s
         ocr = get_paddle_ocr()
         with SuppressOutputFD(suppress=True):
             result = ocr.ocr(img_array)
-        if not result:
-            return ""
-        lines = []
-        if isinstance(result, dict) and 'rec_texts' in result:
-            lines = [str(t) for t in result['rec_texts'] if t]
-        elif isinstance(result, list) and result[0]:
-            for line in result[0]:
-                if line and len(line) >= 2:
-                    text = line[1][0] if isinstance(line[1], (list, tuple)) else line[1]
-                    if text:
-                        lines.append(str(text))
-        return '\n'.join(lines)
+        if result:
+            lines = []
+            if isinstance(result, dict) and 'rec_texts' in result:
+                lines = [str(t) for t in result['rec_texts'] if t]
+            elif isinstance(result, list) and result[0]:
+                for line in result[0]:
+                    if line and len(line) >= 2:
+                        line_text = line[1][0] if isinstance(line[1], (list, tuple)) else line[1]
+                        if line_text:
+                            lines.append(str(line_text))
+            text = '\n'.join(lines)
 
     else:  # tesseract
-        # For tesseract, we need to use the page's built-in OCR on the clip region
-        # This is less efficient but works
         tp = page.get_textpage_ocr(full=True, language="eng", clip=clip)
-        return page.get_text(textpage=tp, clip=clip).strip()
+        text = page.get_text(textpage=tp, clip=clip).strip()
+
+    # Record outcome for learning
+    if learner and features:
+        learner.record_outcome(features, pdf_path, page_num, image_index, True, text, is_exploration)
+
+    return text, True
 
 
-def extract_page_hybrid(page, ocr_engine: str = "surya", dpi: int = 300, debug: bool = False) -> tuple[str, int, int]:
+def extract_page_hybrid(
+    page,
+    ocr_engine: str = "surya",
+    dpi: int = 300,
+    debug: bool = False,
+    learner: AdaptiveLearner | None = None,
+    pdf_path: str = "",
+    page_num: int = 0,
+) -> tuple[str, int, int, int]:
     """Extract text from page using hybrid approach: text extraction + OCR for images.
 
     Args:
@@ -940,9 +1821,12 @@ def extract_page_hybrid(page, ocr_engine: str = "surya", dpi: int = 300, debug: 
         ocr_engine: OCR engine to use for image regions
         dpi: Resolution for rendering images
         debug: Print debug info
+        learner: Optional AdaptiveLearner for skip decisions
+        pdf_path: PDF file path for logging
+        page_num: Page number for logging
 
     Returns:
-        Tuple of (extracted_text, ocr_regions_count, ocr_chars_count)
+        Tuple of (extracted_text, ocr_regions_count, ocr_chars_count, skipped_count)
     """
     # Get all blocks with positions
     # Block format: (x0, y0, x1, y1, text_or_img, block_no, block_type)
@@ -954,6 +1838,8 @@ def extract_page_hybrid(page, ocr_engine: str = "surya", dpi: int = 300, debug: 
 
     ocr_regions = 0
     ocr_chars = 0
+    skipped_regions = 0
+    image_index = 0
 
     for block in blocks:
         x0, y0, x1, y1, content, block_no, block_type = block
@@ -964,10 +1850,26 @@ def extract_page_hybrid(page, ocr_engine: str = "surya", dpi: int = 300, debug: 
             if text:
                 content_blocks.append((y0, text, False))
         else:
-            # Image block - OCR this region
+            # Image block - OCR this region (learner may skip)
             try:
-                img_text = ocr_image_region(page, (x0, y0, x1, y1), ocr_engine, dpi)
-                if img_text and img_text.strip():
+                img_text, was_ocrd = ocr_image_region(
+                    page,
+                    (x0, y0, x1, y1),
+                    ocr_engine,
+                    dpi,
+                    learner=learner,
+                    pdf_path=pdf_path,
+                    page_num=page_num,
+                    image_index=image_index,
+                    text_blocks=blocks,
+                )
+                image_index += 1
+
+                if not was_ocrd:
+                    skipped_regions += 1
+                    if debug:
+                        print(f"    [DEBUG] Skipped image block at y={y0:.0f} (learning)")
+                elif img_text and img_text.strip():
                     content_blocks.append((y0, img_text.strip(), True))
                     ocr_regions += 1
                     ocr_chars += len(img_text)
@@ -983,14 +1885,17 @@ def extract_page_hybrid(page, ocr_engine: str = "surya", dpi: int = 300, debug: 
     # Combine all text
     final_text = '\n\n'.join(block[1] for block in content_blocks)
 
-    return final_text, ocr_regions, ocr_chars
+    return final_text, ocr_regions, ocr_chars, skipped_regions
 
 
 def extract_page_text(
     page,
     ocr_engine: str,
     force_ocr: bool = False,
-    suppress_output: bool = False
+    suppress_output: bool = False,
+    learner: AdaptiveLearner | None = None,
+    pdf_path: str = "",
+    page_num: int = 0,
 ) -> tuple[str, bool, int, str]:
     """Extract text from a single page, using OCR as appropriate.
 
@@ -1004,6 +1909,9 @@ def extract_page_text(
         ocr_engine: OCR engine to use ("surya", "paddle", "tesseract", "none")
         force_ocr: Force full-page OCR regardless of content
         suppress_output: Suppress stdout/stderr during processing
+        learner: Optional AdaptiveLearner for image skip decisions
+        pdf_path: PDF file path for learning
+        page_num: Page number for learning
 
     Returns:
         Tuple of (text, used_ocr, ocr_chars, log_message)
@@ -1031,11 +1939,20 @@ def extract_page_text(
         elif has_images:
             # Hybrid: always extract text + OCR every image, merge by position
             with SuppressOutputFD(suppress=suppress_output):
-                hybrid_text, ocr_regions, ocr_chars = extract_page_hybrid(
-                    page, ocr_engine=ocr_engine
+                hybrid_text, ocr_regions, ocr_chars, skipped = extract_page_hybrid(
+                    page,
+                    ocr_engine=ocr_engine,
+                    learner=learner,
+                    pdf_path=pdf_path,
+                    page_num=page_num,
                 )
-            if ocr_regions > 0:
-                return hybrid_text, True, ocr_chars, f"+{ocr_regions} imgs (+{ocr_chars:,} chars)"
+            if ocr_regions > 0 or skipped > 0:
+                msg_parts = []
+                if ocr_regions > 0:
+                    msg_parts.append(f"+{ocr_regions} imgs (+{ocr_chars:,} chars)")
+                if skipped > 0:
+                    msg_parts.append(f"skipped {skipped}")
+                return hybrid_text, ocr_regions > 0, ocr_chars, ", ".join(msg_parts)
             else:
                 return hybrid_text, False, 0, ""
 
@@ -1094,7 +2011,8 @@ def extract_text_from_pdf(
     ocr_engine: str = "paddle",
     force_ocr: bool = False,
     stats: ProcessingStats | None = None,
-    hud: RetroHUD | None = None
+    hud: RetroHUD | None = None,
+    learner: AdaptiveLearner | None = None,
 ) -> list[str]:
     """Extract text from PDF, returning list of page contents."""
     import pymupdf
@@ -1124,7 +2042,13 @@ def extract_text_from_pdf(
             # Extract page text (with OCR if available and needed)
             engine = active_engine if ocr_available else "none"
             text, used_ocr, ocr_chars, log_msg = extract_page_text(
-                page, engine, force_ocr, suppress_output=suppress
+                page,
+                engine,
+                force_ocr,
+                suppress_output=suppress,
+                learner=learner,
+                pdf_path=str(pdf_path),
+                page_num=page_num,
             )
 
             if stats:
@@ -1170,7 +2094,8 @@ def process_pdf(
     force_ocr: bool = False,
     improve: bool = False,
     stats: ProcessingStats | None = None,
-    hud: RetroHUD | None = None
+    hud: RetroHUD | None = None,
+    learner: AdaptiveLearner | None = None,
 ) -> tuple[bool, str, str | None]:
     """Process a single PDF file.
 
@@ -1186,7 +2111,10 @@ def process_pdf(
 
         try:
             # Extract new version
-            pages = extract_text_from_pdf(pdf_path, use_ocr=use_ocr, ocr_engine=ocr_engine, force_ocr=force_ocr, stats=stats, hud=hud)
+            pages = extract_text_from_pdf(
+                pdf_path, use_ocr=use_ocr, ocr_engine=ocr_engine,
+                force_ocr=force_ocr, stats=stats, hud=hud, learner=learner
+            )
             new_markdown = create_markdown(pdf_path, pages)
             new_text = '\n'.join(pages)
 
@@ -1222,7 +2150,10 @@ def process_pdf(
         return True, f"{action}: {md_path.name}", None
 
     try:
-        pages = extract_text_from_pdf(pdf_path, use_ocr=use_ocr, ocr_engine=ocr_engine, force_ocr=force_ocr, stats=stats, hud=hud)
+        pages = extract_text_from_pdf(
+            pdf_path, use_ocr=use_ocr, ocr_engine=ocr_engine,
+            force_ocr=force_ocr, stats=stats, hud=hud, learner=learner
+        )
         markdown_content = create_markdown(pdf_path, pages)
         md_path.write_text(markdown_content, encoding='utf-8')
         if stats:
@@ -1548,14 +2479,21 @@ def run_with_hud_parallel(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str
     return 1 if stats.failed_files > 0 else 0
 
 
-def run_with_hud(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, force_ocr: bool) -> int:
+def run_with_hud(
+    pdfs: list[Path],
+    args,
+    use_ocr: bool,
+    ocr_engine: str,
+    force_ocr: bool,
+    learner: AdaptiveLearner | None = None,
+) -> int:
     """Run processing with the retro HUD."""
     stats = ProcessingStats()
     stats.total_files = len(pdfs)
     stats.total_bytes = sum(p.stat().st_size for p in pdfs)
     improve_mode = getattr(args, 'improve', False)
 
-    with RetroHUD(stats) as hud:
+    with RetroHUD(stats, learner=learner) as hud:
         hud.refresh()
 
         for pdf_path in sorted(pdfs):
@@ -1575,7 +2513,8 @@ def run_with_hud(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, force_o
                 force_ocr=force_ocr,
                 improve=improve_mode,
                 stats=stats,
-                hud=hud
+                hud=hud,
+                learner=learner,
             )
 
             stats.log(f"  → {message}")
@@ -1609,6 +2548,11 @@ def run_with_hud(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, force_o
         if improve_mode:
             stats.log(f" Improved: {stats.improved_files} | Kept: {stats.kept_existing}")
         stats.log(f" Time: {stats.elapsed():.1f}s | OCR pages: {stats.ocr_pages}")
+        # Show learning stats if enabled
+        if learner and learner.enabled:
+            learn_stats = learner._stats
+            if learn_stats["images_seen"] > 0:
+                stats.log(f" Learning: {learn_stats['images_ocrd']} OCR'd, {learn_stats['images_skipped']} skipped")
         stats.log("═" * 40)
         hud.refresh()
 
@@ -1622,7 +2566,14 @@ def run_with_hud(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, force_o
     return 1 if stats.failed_files > 0 else 0
 
 
-def run_simple(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, force_ocr: bool) -> int:
+def run_simple(
+    pdfs: list[Path],
+    args,
+    use_ocr: bool,
+    ocr_engine: str,
+    force_ocr: bool,
+    learner: AdaptiveLearner | None = None,
+) -> int:
     """Run processing with simple text output."""
     stats = ProcessingStats()
     stats.total_files = len(pdfs)
@@ -1634,6 +2585,8 @@ def run_simple(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, force_ocr
             print("(Dry run - no files will be created)")
         if improve_mode:
             print("(Improve mode - comparing quality)")
+        if learner and learner.enabled:
+            print("(Adaptive learning enabled)")
         print(f"OCR engine: {ocr_engine}")
         print()
 
@@ -1651,7 +2604,8 @@ def run_simple(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, force_ocr
             ocr_engine=ocr_engine,
             force_ocr=force_ocr,
             improve=improve_mode,
-            stats=stats
+            stats=stats,
+            learner=learner,
         )
 
         if args.verbose:
@@ -1702,6 +2656,28 @@ def run_simple(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, force_ocr
             print(f"  MD output:       {md_mb:.2f} MB ({ratio:.1f}% of input)")
             print(f"  Processing rate: {files_per_min:.1f} files/min, {mb_per_min:.2f} MB/min")
             print(f"  OCR stats:       {stats.ocr_pages} pages, {stats.ocr_chars:,} chars extracted")
+
+        # Print learning stats if enabled
+        if learner and learner.enabled:
+            ls = learner._stats
+            if ls["images_seen"] > 0:
+                print()
+                print(f"Learning:")
+                print(f"  Images seen:     {ls['images_seen']:,}")
+                print(f"  Images OCR'd:    {ls['images_ocrd']:,} ({ls['ocr_useful']} useful, {ls['ocr_empty']} empty)")
+                print(f"  Images skipped:  {ls['images_skipped']:,}")
+
+                # OCR efficiency
+                total_ocrd = ls['ocr_useful'] + ls['ocr_empty']
+                if total_ocrd > 0:
+                    ocr_eff = ls['ocr_useful'] / total_ocrd * 100
+                    print(f"  OCR efficiency:  {ocr_eff:.1f}% found useful text")
+
+                # Exploration accuracy
+                exp_total = ls['exploration_useful'] + ls['exploration_empty']
+                if exp_total > 0:
+                    miss_rate = ls['exploration_useful'] / exp_total * 100
+                    print(f"  Exploration:     {exp_total} samples, {miss_rate:.1f}% would be missed if skipped")
 
     return 1 if stats.failed_files > 0 else 0
 
@@ -1792,11 +2768,90 @@ def main() -> int:
         help="Number of parallel workers (default: CPU count - 1, use 1 for sequential)"
     )
 
+    # Adaptive learning options
+    parser.add_argument(
+        "--learn",
+        action="store_true",
+        help="Enable adaptive OCR learning (learns which images are worth OCR'ing)"
+    )
+    parser.add_argument(
+        "--learn-db",
+        type=str,
+        metavar="PATH",
+        help=f"Custom path for learning database (default: ~/.pdf2txt/learning.db)"
+    )
+    parser.add_argument(
+        "--learn-stats",
+        action="store_true",
+        help="Print learning statistics and exit"
+    )
+    parser.add_argument(
+        "--learn-reset",
+        action="store_true",
+        help="Reset the learning database and exit"
+    )
+    parser.add_argument(
+        "--learn-recluster",
+        action="store_true",
+        help="Re-run clustering on collected data and exit"
+    )
+
     args = parser.parse_args()
 
     # Force CPU mode if requested (must be set before any CUDA imports)
     if args.cpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+    # Handle learning database commands early
+    learn_db_path = Path(args.learn_db) if args.learn_db else None
+
+    if args.learn_stats:
+        learner = AdaptiveLearner(db_path=learn_db_path, enabled=True)
+        stats = learner.get_stats()
+        if not stats["enabled"]:
+            print("Learning database not found or empty.")
+            return 0
+
+        print("═" * 60)
+        print("  PDF2TXT - ADAPTIVE LEARNING STATISTICS")
+        print("═" * 60)
+        print(f"  Database: {stats['db_path']}")
+        print(f"  Processed files: {stats['processed_files']:,}")
+        print(f"  Total pages: {stats['total_pages_processed']:,}")
+        print(f"  Total images: {stats['total_images_seen']:,}")
+        print()
+        print(f"  OCR outcomes: {stats['total_records']:,} records")
+        print(f"  OCR'd images: {stats['ocrd_records']:,}")
+        print(f"  Useful results: {stats['useful_records']:,} ({stats['overall_useful_rate']:.1%})")
+        print()
+        if stats['clusters']:
+            print(f"  Clusters: {stats['num_clusters']}")
+            for c in stats['clusters']:
+                conf_bar = "█" * int(c['confidence'] * 10)
+                print(f"    #{c['id']:2d}: {c['samples']:5d} samples, "
+                      f"{c['useful_rate']:.1%} useful, conf [{conf_bar:<10}]")
+        else:
+            print("  No clusters formed yet (need more data)")
+        print("═" * 60)
+        learner.close()
+        return 0
+
+    if args.learn_reset:
+        learner = AdaptiveLearner(db_path=learn_db_path, enabled=True)
+        db_path = learner.db_path
+        learner.reset()
+        print(f"Learning database reset: {db_path}")
+        learner.close()
+        return 0
+
+    if args.learn_recluster:
+        learner = AdaptiveLearner(db_path=learn_db_path, enabled=True)
+        print("Re-clustering OCR outcomes...")
+        learner.recluster(force=True)
+        stats = learner.get_stats()
+        print(f"Formed {stats['num_clusters']} clusters from {stats['ocrd_records']} records")
+        learner.close()
+        return 0
 
     # Convert and validate path
     directory = convert_windows_path(args.directory)
@@ -1871,19 +2926,40 @@ def main() -> int:
     max_workers = args.jobs if args.jobs is not None else default_workers
     max_workers = max(1, max_workers)  # Ensure at least 1
 
-    # Run with HUD or simple mode, sequential or parallel
-    if max_workers == 1:
-        # Sequential processing (original behavior)
-        if args.hud and not args.dry_run:
-            return run_with_hud(pdfs, args, use_ocr, ocr_engine, force_ocr)
+    # Create learner if learning is enabled
+    # Note: Learning only works in sequential mode (max_workers=1) because
+    # the SQLite database doesn't work well across process boundaries
+    learner = None
+    if args.learn:
+        if max_workers > 1:
+            if not args.quiet:
+                print("Note: Adaptive learning requires sequential mode (-j 1). Disabling parallelism.", file=sys.stderr)
+            max_workers = 1
+        learner = AdaptiveLearner(db_path=learn_db_path, enabled=True)
+        if not args.quiet:
+            stats = learner.get_stats()
+            print(f"Adaptive learning enabled (db: {learner.db_path})")
+            if stats['processed_files'] > 0:
+                print(f"  History: {stats['processed_files']} files, {stats['total_images_seen']} images, {stats['overall_useful_rate']:.1%} useful")
+            print()
+
+    try:
+        # Run with HUD or simple mode, sequential or parallel
+        if max_workers == 1:
+            # Sequential processing (original behavior)
+            if args.hud and not args.dry_run:
+                return run_with_hud(pdfs, args, use_ocr, ocr_engine, force_ocr, learner=learner)
+            else:
+                return run_simple(pdfs, args, use_ocr, ocr_engine, force_ocr, learner=learner)
         else:
-            return run_simple(pdfs, args, use_ocr, ocr_engine, force_ocr)
-    else:
-        # Parallel processing
-        if args.hud and not args.dry_run:
-            return run_with_hud_parallel(pdfs, args, use_ocr, ocr_engine, force_ocr, max_workers)
-        else:
-            return run_simple_parallel(pdfs, args, use_ocr, ocr_engine, force_ocr, max_workers)
+            # Parallel processing (no learner support)
+            if args.hud and not args.dry_run:
+                return run_with_hud_parallel(pdfs, args, use_ocr, ocr_engine, force_ocr, max_workers)
+            else:
+                return run_simple_parallel(pdfs, args, use_ocr, ocr_engine, force_ocr, max_workers)
+    finally:
+        if learner:
+            learner.close()
 
 
 if __name__ == "__main__":
