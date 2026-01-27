@@ -324,16 +324,16 @@ class RetroHUD:
             height, width = self.stdscr.getmaxyx()
             width = min(width, 100)  # Cap width
 
-            # Title banner
+            # Title banner (all lines 65 chars)
             banner = [
-                "╔═══════════════════════════════════════════════════════════╗",
-                "║   ██████╗ ██████╗ ███████╗██████╗ ████████╗██╗  ██╗████████╗ ║",
-                "║   ██╔══██╗██╔══██╗██╔════╝╚════██╗╚══██╔══╝╚██╗██╔╝╚══██╔══╝ ║",
-                "║   ██████╔╝██║  ██║█████╗   █████╔╝   ██║    ╚███╔╝    ██║    ║",
-                "║   ██╔═══╝ ██║  ██║██╔══╝  ██╔═══╝    ██║    ██╔██╗    ██║    ║",
-                "║   ██║     ██████╔╝██║     ███████╗   ██║   ██╔╝ ██╗   ██║    ║",
-                "║   ╚═╝     ╚═════╝ ╚═╝     ╚══════╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝    ║",
-                "╚═══════════════════════════════════════════════════════════╝",
+                "╔═══════════════════════════════════════════════════════════════╗",
+                "║   ██████╗ ██████╗ ███████╗██████╗ ████████╗██╗  ██╗████████╗  ║",
+                "║   ██╔══██╗██╔══██╗██╔════╝╚════██╗╚══██╔══╝╚██╗██╔╝╚══██╔══╝  ║",
+                "║   ██████╔╝██║  ██║█████╗   █████╔╝   ██║    ╚███╔╝    ██║     ║",
+                "║   ██╔═══╝ ██║  ██║██╔══╝  ██╔═══╝    ██║    ██╔██╗    ██║     ║",
+                "║   ██║     ██████╔╝██║     ███████╗   ██║   ██╔╝ ██╗   ██║     ║",
+                "║   ╚═╝     ╚═════╝ ╚═╝     ╚══════╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝     ║",
+                "╚═══════════════════════════════════════════════════════════════╝",
             ]
 
             # Simpler banner if terminal is narrow
@@ -826,6 +826,125 @@ def ocr_page_with_surya(page, dpi: int = 300) -> str:
     return '\n'.join(lines)
 
 
+def ocr_image_region(page, bbox, ocr_engine: str = "surya", dpi: int = 300) -> str:
+    """OCR a specific region of a page.
+
+    Args:
+        page: PyMuPDF page object
+        bbox: Tuple of (x0, y0, x1, y1) defining the region
+        ocr_engine: "surya", "paddle", or "tesseract"
+        dpi: Resolution for rendering
+
+    Returns:
+        Extracted text from the region
+    """
+    import io
+    from PIL import Image
+
+    # Create a clip rect for the region
+    import pymupdf
+    clip = pymupdf.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
+
+    # Render just this region at the specified DPI
+    mat = pymupdf.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, clip=clip)
+    img_data = pix.tobytes("png")
+    img = Image.open(io.BytesIO(img_data))
+
+    # Skip tiny images (likely decorative)
+    if img.width < 20 or img.height < 10:
+        return ""
+
+    if ocr_engine == "surya":
+        models = get_surya_ocr()
+        rec_results = models['recognition']([img], det_predictor=models['detection'])
+        if not rec_results or not rec_results[0]:
+            return ""
+        lines = [tl.text for tl in rec_results[0].text_lines if tl.text]
+        return '\n'.join(lines)
+
+    elif ocr_engine == "paddle":
+        import numpy as np
+        if img.mode == 'RGBA':
+            img = img.convert('RGB')
+        img_array = np.array(img)
+        ocr = get_paddle_ocr()
+        with SuppressOutputFD(suppress=True):
+            result = ocr.ocr(img_array)
+        if not result:
+            return ""
+        lines = []
+        if isinstance(result, dict) and 'rec_texts' in result:
+            lines = [str(t) for t in result['rec_texts'] if t]
+        elif isinstance(result, list) and result[0]:
+            for line in result[0]:
+                if line and len(line) >= 2:
+                    text = line[1][0] if isinstance(line[1], (list, tuple)) else line[1]
+                    if text:
+                        lines.append(str(text))
+        return '\n'.join(lines)
+
+    else:  # tesseract
+        # For tesseract, we need to use the page's built-in OCR on the clip region
+        # This is less efficient but works
+        tp = page.get_textpage_ocr(full=True, language="eng", clip=clip)
+        return page.get_text(textpage=tp, clip=clip).strip()
+
+
+def extract_page_hybrid(page, ocr_engine: str = "surya", dpi: int = 300, debug: bool = False) -> tuple[str, int, int]:
+    """Extract text from page using hybrid approach: text extraction + OCR for images.
+
+    Args:
+        page: PyMuPDF page object
+        ocr_engine: OCR engine to use for image regions
+        dpi: Resolution for rendering images
+        debug: Print debug info
+
+    Returns:
+        Tuple of (extracted_text, ocr_regions_count, ocr_chars_count)
+    """
+    # Get all blocks with positions
+    # Block format: (x0, y0, x1, y1, text_or_img, block_no, block_type)
+    # block_type: 0=text, 1=image
+    blocks = page.get_text("blocks")
+
+    # Separate text and image blocks
+    content_blocks = []  # (y0, text, is_ocr)
+
+    ocr_regions = 0
+    ocr_chars = 0
+
+    for block in blocks:
+        x0, y0, x1, y1, content, block_no, block_type = block
+
+        if block_type == 0:
+            # Text block - use as-is
+            text = content.strip()
+            if text:
+                content_blocks.append((y0, text, False))
+        else:
+            # Image block - OCR this region
+            try:
+                img_text = ocr_image_region(page, (x0, y0, x1, y1), ocr_engine, dpi)
+                if img_text and img_text.strip():
+                    content_blocks.append((y0, img_text.strip(), True))
+                    ocr_regions += 1
+                    ocr_chars += len(img_text)
+                    if debug:
+                        print(f"    [DEBUG] OCR'd image block at y={y0:.0f}: {len(img_text)} chars")
+            except Exception as e:
+                if debug:
+                    print(f"    [DEBUG] Failed to OCR image at y={y0:.0f}: {e}")
+
+    # Sort by y-position (reading order: top to bottom)
+    content_blocks.sort(key=lambda x: x[0])
+
+    # Combine all text
+    final_text = '\n\n'.join(block[1] for block in content_blocks)
+
+    return final_text, ocr_regions, ocr_chars
+
+
 class SuppressOutputFD:
     """Context manager to suppress stdout/stderr at the OS file descriptor level.
 
@@ -945,32 +1064,61 @@ def extract_text_from_pdf(
 
             if ocr_available and (force_ocr or page_needs_ocr(page)):
                 try:
-                    if stats:
-                        stats.current_status = f"OCR ({ocr_engine}) page {page_num}/{total_pages}..."
-                        if hud:
-                            hud.refresh()
+                    # Decide between full-page OCR vs hybrid (text + image OCR)
+                    has_images = len(page.get_images(full=False)) > 0
+                    has_text = len(text) > 100  # Significant extractable text
 
-                    with SuppressOutputFD(suppress=(hud is not None)):
-                        if ocr_engine == "surya":
-                            ocr_text = ocr_page_with_surya(page)
-                        elif ocr_engine == "paddle":
-                            ocr_text = ocr_page_with_paddle(page)
-                        else:  # tesseract
-                            tp = page.get_textpage_ocr(full=True, language="eng")
-                            ocr_text = page.get_text(textpage=tp).strip()
-
-                    orig_len = len(text)
-                    ocr_len = len(ocr_text)
-
-                    if ocr_len > orig_len:
-                        text = ocr_text
+                    if force_ocr or not has_text:
+                        # Full page OCR: either forced, or page is mostly images/scanned
                         if stats:
-                            stats.ocr_pages += 1
-                            stats.ocr_chars += ocr_len
-                            stats.log(f"  OCR p{page_num}: +{ocr_len:,} chars ({ocr_engine})")
-                    else:
+                            stats.current_status = f"OCR ({ocr_engine}) page {page_num}/{total_pages}..."
+                            if hud:
+                                hud.refresh()
+
+                        with SuppressOutputFD(suppress=(hud is not None)):
+                            if ocr_engine == "surya":
+                                ocr_text = ocr_page_with_surya(page)
+                            elif ocr_engine == "paddle":
+                                ocr_text = ocr_page_with_paddle(page)
+                            else:  # tesseract
+                                tp = page.get_textpage_ocr(full=True, language="eng")
+                                ocr_text = page.get_text(textpage=tp).strip()
+
+                        orig_len = len(text)
+                        ocr_len = len(ocr_text)
+
+                        if ocr_len > orig_len:
+                            text = ocr_text
+                            if stats:
+                                stats.ocr_pages += 1
+                                stats.ocr_chars += ocr_len
+                                stats.log(f"  OCR p{page_num}: +{ocr_len:,} chars ({ocr_engine})")
+                        else:
+                            if stats:
+                                stats.log(f"  OCR p{page_num}: kept original ({orig_len:,} chars)")
+
+                    elif has_images and has_text:
+                        # Hybrid mode: extract text + OCR just the image regions
                         if stats:
-                            stats.log(f"  OCR p{page_num}: kept original ({orig_len:,} chars)")
+                            stats.current_status = f"Hybrid OCR p{page_num}/{total_pages}..."
+                            if hud:
+                                hud.refresh()
+
+                        with SuppressOutputFD(suppress=(hud is not None)):
+                            hybrid_text, ocr_regions, ocr_chars = extract_page_hybrid(
+                                page, ocr_engine=ocr_engine
+                            )
+
+                        if ocr_regions > 0:
+                            text = hybrid_text
+                            if stats:
+                                stats.ocr_pages += 1
+                                stats.ocr_chars += ocr_chars
+                                stats.log(f"  Hybrid p{page_num}: {ocr_regions} images OCR'd (+{ocr_chars:,} chars)")
+                        else:
+                            if stats:
+                                stats.log(f"  Hybrid p{page_num}: no text in images")
+
                 except Exception as e:
                     if stats:
                         stats.log(f"  OCR p{page_num}: FAILED - {e}")
@@ -1163,23 +1311,43 @@ def process_pdf_worker(
 
                 if ocr_available and (force_ocr or page_needs_ocr(page)):
                     try:
-                        if active_engine == "surya":
-                            ocr_text = ocr_page_with_surya(page)
-                        elif active_engine == "paddle":
-                            ocr_text = ocr_page_with_paddle(page)
-                        else:  # tesseract
-                            tp = page.get_textpage_ocr(full=True, language="eng")
-                            ocr_text = page.get_text(textpage=tp).strip()
+                        # Decide between full-page OCR vs hybrid
+                        has_images = len(page.get_images(full=False)) > 0
+                        has_text = len(text) > 100
 
-                        orig_len = len(text)
-                        ocr_len = len(ocr_text)
-                        if ocr_len > orig_len:
-                            text = ocr_text
-                            ocr_pages_count += 1
-                            ocr_chars_count += ocr_len
-                            log_msgs.append(f"  p{page_num}/{total_pages}: OCR +{ocr_len:,} chars")
-                        else:
-                            log_msgs.append(f"  p{page_num}/{total_pages}: kept original ({orig_len:,} chars)")
+                        if force_ocr or not has_text:
+                            # Full page OCR
+                            if active_engine == "surya":
+                                ocr_text = ocr_page_with_surya(page)
+                            elif active_engine == "paddle":
+                                ocr_text = ocr_page_with_paddle(page)
+                            else:  # tesseract
+                                tp = page.get_textpage_ocr(full=True, language="eng")
+                                ocr_text = page.get_text(textpage=tp).strip()
+
+                            orig_len = len(text)
+                            ocr_len = len(ocr_text)
+                            if ocr_len > orig_len:
+                                text = ocr_text
+                                ocr_pages_count += 1
+                                ocr_chars_count += ocr_len
+                                log_msgs.append(f"  p{page_num}/{total_pages}: OCR +{ocr_len:,} chars")
+                            else:
+                                log_msgs.append(f"  p{page_num}/{total_pages}: kept original ({orig_len:,} chars)")
+
+                        elif has_images and has_text:
+                            # Hybrid mode: text + OCR image regions
+                            hybrid_text, ocr_regions, ocr_chars = extract_page_hybrid(
+                                page, ocr_engine=active_engine
+                            )
+                            if ocr_regions > 0:
+                                text = hybrid_text
+                                ocr_pages_count += 1
+                                ocr_chars_count += ocr_chars
+                                log_msgs.append(f"  p{page_num}/{total_pages}: Hybrid {ocr_regions} imgs (+{ocr_chars:,} chars)")
+                            else:
+                                log_msgs.append(f"  p{page_num}/{total_pages}: Hybrid (no text in images)")
+
                     except Exception as e:
                         log_msgs.append(f"  p{page_num}/{total_pages}: OCR FAILED - {e}")
 
