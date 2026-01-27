@@ -476,8 +476,7 @@ class AdaptiveLearner:
             FROM ocr_outcomes
             WHERE ocr_performed = 1
             ORDER BY timestamp DESC
-            LIMIT ?
-        """, (self.MAX_RECORDS,))
+        """)
 
         rows = cursor.fetchall()
         if len(rows) < self.NUM_CLUSTERS * 2:
@@ -2113,6 +2112,17 @@ def extract_text_from_pdf(
                 stats.processed_pages += 1
 
             pages.append(text)
+
+        # Record file as processed for learning (track by content hash)
+        if learner and learner.enabled:
+            # Count total images in the document
+            total_images = sum(len(p.get_images(full=False)) for p in doc)
+            learner.record_file_processed(pdf_path, total_pages, total_images)
+
+            # Trigger re-clustering periodically (every 100 new outcomes)
+            db_stats = learner.get_stats()
+            if db_stats['ocrd_records'] >= 50 and db_stats['ocrd_records'] % 100 < 10:
+                learner.recluster()
     finally:
         doc.close()
 
