@@ -1828,6 +1828,8 @@ def extract_page_hybrid(
     Returns:
         Tuple of (extracted_text, ocr_regions_count, ocr_chars_count, skipped_count)
     """
+    import pymupdf
+
     # Get all blocks with positions
     # Block format: (x0, y0, x1, y1, text_or_img, block_no, block_type)
     # block_type: 0=text, 1=image
@@ -1841,6 +1843,9 @@ def extract_page_hybrid(
     skipped_regions = 0
     image_index = 0
 
+    # Track which areas we've processed as image blocks
+    processed_rects = []
+
     for block in blocks:
         x0, y0, x1, y1, content, block_no, block_type = block
 
@@ -1851,6 +1856,7 @@ def extract_page_hybrid(
                 content_blocks.append((y0, text, False))
         else:
             # Image block - OCR this region (learner may skip)
+            processed_rects.append(pymupdf.Rect(x0, y0, x1, y1))
             try:
                 img_text, was_ocrd = ocr_image_region(
                     page,
@@ -1878,6 +1884,53 @@ def extract_page_hybrid(
             except Exception as e:
                 if debug:
                     print(f"    [DEBUG] Failed to OCR image at y={y0:.0f}: {e}")
+
+    # Also check for images via get_images() that weren't detected as blocks
+    # This catches images that PyMuPDF doesn't return as block_type=1
+    for img_info in page.get_images(full=True):
+        xref = img_info[0]
+        try:
+            # Get bounding box(es) for this image on the page
+            img_rects = page.get_image_rects(xref)
+            for rect in img_rects:
+                # Skip if we already processed this area as an image block
+                already_processed = any(
+                    rect.intersects(pr) and rect.get_area() > 0 and
+                    abs(rect.get_area() - pr.get_area()) / max(rect.get_area(), 1) < 0.5
+                    for pr in processed_rects
+                )
+                if already_processed:
+                    continue
+
+                x0, y0, x1, y1 = rect
+                processed_rects.append(rect)
+
+                img_text, was_ocrd = ocr_image_region(
+                    page,
+                    (x0, y0, x1, y1),
+                    ocr_engine,
+                    dpi,
+                    learner=learner,
+                    pdf_path=pdf_path,
+                    page_num=page_num,
+                    image_index=image_index,
+                    text_blocks=blocks,
+                )
+                image_index += 1
+
+                if not was_ocrd:
+                    skipped_regions += 1
+                    if debug:
+                        print(f"    [DEBUG] Skipped image (xref={xref}) at y={y0:.0f} (learning)")
+                elif img_text and img_text.strip():
+                    content_blocks.append((y0, img_text.strip(), True))
+                    ocr_regions += 1
+                    ocr_chars += len(img_text)
+                    if debug:
+                        print(f"    [DEBUG] OCR'd image (xref={xref}) at y={y0:.0f}: {len(img_text)} chars")
+        except Exception as e:
+            if debug:
+                print(f"    [DEBUG] Failed to process image xref={xref}: {e}")
 
     # Sort by y-position (reading order: top to bottom)
     content_blocks.sort(key=lambda x: x[0])
