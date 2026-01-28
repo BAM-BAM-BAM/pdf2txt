@@ -154,7 +154,7 @@ class AdaptiveLearner:
         self.db_path = db_path or self.DEFAULT_DB_PATH
         self.enabled = enabled
         self._conn = None
-        self._classifier = None  # Trained LogisticRegression model
+        self._classifier = None  # Trained DecisionTreeClassifier model
         self._total_samples = 0  # Total training samples
         self._last_train_count = 0  # Samples at last training
 
@@ -346,13 +346,12 @@ class AdaptiveLearner:
             self._region_sample_counts[key] = row["count"]
 
     def _train_classifier(self):
-        """Train logistic regression classifier on OCR outcomes."""
+        """Train decision tree classifier on OCR outcomes."""
         if not self._conn or self._total_samples < self.MIN_SAMPLES_FOR_PREDICTION:
             return
 
         try:
-            from sklearn.linear_model import LogisticRegression
-            from sklearn.calibration import CalibratedClassifierCV
+            from sklearn.tree import DecisionTreeClassifier
             import numpy as np
         except ImportError:
             # sklearn not available, fall back to heuristics
@@ -394,35 +393,15 @@ class AdaptiveLearner:
         X = np.array(X)
         y = np.array(y)
 
-        # Train base classifier
-        base_classifier = LogisticRegression(
+        # Train decision tree classifier
+        # Decision trees naturally handle non-linear boundaries and provide
+        # well-calibrated probabilities from leaf node class distributions
+        self._classifier = DecisionTreeClassifier(
             class_weight='balanced',  # Handle imbalanced classes
-            max_iter=500,
+            max_depth=10,  # Prevent overfitting while capturing patterns
             random_state=42,
         )
-
-        # Use probability calibration for better uncertainty estimates
-        # CalibratedClassifierCV uses cross-validation to produce well-calibrated probabilities
-        # This prevents the classifier from being overconfident on edge cases
-        try:
-            # Need enough samples per class for cross-validation (cv=3 requires ~9 per class minimum)
-            class_counts = np.bincount(y)
-            min_class_count = min(class_counts) if len(class_counts) > 1 else 0
-
-            if min_class_count >= 10:
-                # Use sigmoid calibration (Platt scaling) with 3-fold CV
-                self._classifier = CalibratedClassifierCV(
-                    base_classifier, method='sigmoid', cv=3
-                )
-                self._classifier.fit(X, y)
-            else:
-                # Not enough samples for calibration, use base classifier
-                base_classifier.fit(X, y)
-                self._classifier = base_classifier
-        except Exception:
-            # Calibration failed, fall back to base classifier
-            base_classifier.fit(X, y)
-            self._classifier = base_classifier
+        self._classifier.fit(X, y)
 
         self._last_train_count = len(X)
 
@@ -925,8 +904,7 @@ class AdaptiveLearner:
         sklearn_available = True
         sklearn_error = None
         try:
-            from sklearn.linear_model import LogisticRegression  # noqa
-            from sklearn.calibration import CalibratedClassifierCV  # noqa
+            from sklearn.tree import DecisionTreeClassifier  # noqa
         except ImportError as e:
             sklearn_available = False
             sklearn_error = str(e)
@@ -2922,6 +2900,14 @@ def run_with_hud(
             stats.current_page = 0
             stats.current_file_pages = 0
             file_size = pdf_path.stat().st_size
+
+            # Skip files already processed when learning is enabled (deduplication)
+            if learner and learner.enabled and learner.is_file_processed(pdf_path):
+                stats.log(f"Skipping (already learned): {pdf_path.name}")
+                stats.skipped_files += 1
+                hud.refresh()
+                continue
+
             stats.log(f"Processing: {pdf_path.name}")
             hud.refresh()
 
@@ -3012,6 +2998,13 @@ def run_simple(
         print()
 
     for pdf_path in sorted(pdfs):
+        # Skip files already processed when learning is enabled (deduplication)
+        if learner and learner.enabled and learner.is_file_processed(pdf_path):
+            if args.verbose:
+                print(f"Skipping (already learned): {pdf_path}")
+            stats.skipped_files += 1
+            continue
+
         if args.verbose:
             print(f"Processing: {pdf_path}")
 
