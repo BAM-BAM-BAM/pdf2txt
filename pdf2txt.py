@@ -149,12 +149,24 @@ class AdaptiveLearner:
     QUALITY_REGRESSION_THRESHOLD = -0.02  # Delta < this = regressed
 
     def __init__(self, db_path: Path | None = None, enabled: bool = True):
+        from collections import deque
+
         self.db_path = db_path or self.DEFAULT_DB_PATH
         self.enabled = enabled
         self._conn = None
         self._classifier = None  # Trained LogisticRegression model
         self._total_samples = 0  # Total training samples
         self._last_train_count = 0  # Samples at last training
+
+        # Track recent predictions for adaptive exploration rate
+        # Each entry: (predicted_prob, was_actually_useful)
+        self._recent_predictions: deque[tuple[float, bool]] = deque(maxlen=100)
+
+        # Track sample counts by feature region for UCB exploration bonus
+        # Keys are (size_bin, brightness_bin, region) tuples
+        from collections import defaultdict
+        self._region_sample_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+
         self._stats = {
             "images_seen": 0,
             "images_skipped": 0,
@@ -290,10 +302,44 @@ class AdaptiveLearner:
             except Exception:
                 self._classifier = None
 
+        # Load region sample counts for UCB exploration bonus
+        self._load_region_sample_counts()
+
         # Retrain if needed
         if self._total_samples >= self.MIN_SAMPLES_FOR_PREDICTION:
             if self._classifier is None or (self._total_samples - self._last_train_count) >= self.RETRAIN_INTERVAL:
                 self._train_classifier()
+
+    def _load_region_sample_counts(self):
+        """Load region sample counts from database for UCB exploration bonus."""
+        if not self._conn:
+            return
+
+        # Query database to compute region sample counts
+        # Bins: area -> small/medium/large, brightness -> dark/medium/bright, region
+        cursor = self._conn.execute("""
+            SELECT
+                CASE
+                    WHEN area < 10000 THEN 'small'
+                    WHEN area < 50000 THEN 'medium'
+                    ELSE 'large'
+                END as size_bin,
+                CASE
+                    WHEN brightness_mean < 100 THEN 'dark'
+                    WHEN brightness_mean < 200 THEN 'medium'
+                    ELSE 'bright'
+                END as brightness_bin,
+                region,
+                COUNT(*) as count
+            FROM ocr_outcomes
+            WHERE ocr_performed = 1
+            GROUP BY size_bin, brightness_bin, region
+        """)
+
+        self._region_sample_counts.clear()
+        for row in cursor:
+            key = (row["size_bin"], row["brightness_bin"], row["region"])
+            self._region_sample_counts[key] = row["count"]
 
     def _train_classifier(self):
         """Train logistic regression classifier on OCR outcomes."""
@@ -302,6 +348,7 @@ class AdaptiveLearner:
 
         try:
             from sklearn.linear_model import LogisticRegression
+            from sklearn.calibration import CalibratedClassifierCV
             import numpy as np
         except ImportError:
             # sklearn not available, fall back to heuristics
@@ -343,13 +390,36 @@ class AdaptiveLearner:
         X = np.array(X)
         y = np.array(y)
 
-        # Train classifier
-        self._classifier = LogisticRegression(
+        # Train base classifier
+        base_classifier = LogisticRegression(
             class_weight='balanced',  # Handle imbalanced classes
             max_iter=500,
             random_state=42,
         )
-        self._classifier.fit(X, y)
+
+        # Use probability calibration for better uncertainty estimates
+        # CalibratedClassifierCV uses cross-validation to produce well-calibrated probabilities
+        # This prevents the classifier from being overconfident on edge cases
+        try:
+            # Need enough samples per class for cross-validation (cv=3 requires ~9 per class minimum)
+            class_counts = np.bincount(y)
+            min_class_count = min(class_counts) if len(class_counts) > 1 else 0
+
+            if min_class_count >= 10:
+                # Use sigmoid calibration (Platt scaling) with 3-fold CV
+                self._classifier = CalibratedClassifierCV(
+                    base_classifier, method='sigmoid', cv=3
+                )
+                self._classifier.fit(X, y)
+            else:
+                # Not enough samples for calibration, use base classifier
+                base_classifier.fit(X, y)
+                self._classifier = base_classifier
+        except Exception:
+            # Calibration failed, fall back to base classifier
+            base_classifier.fit(X, y)
+            self._classifier = base_classifier
+
         self._last_train_count = len(X)
 
         # Save classifier to database
@@ -374,7 +444,7 @@ class AdaptiveLearner:
         self._conn.commit()
 
     def _exploration_rate(self) -> float:
-        """Calculate adaptive exploration rate based on sample count."""
+        """Calculate sample-based exploration rate (exponential decay)."""
         if self._total_samples < self.MIN_SAMPLES_FOR_PREDICTION:
             return self.MAX_EXPLORATION_RATE  # Explore heavily when learning
         # Exponential decay: halve every EXPLORATION_HALFLIFE samples
@@ -382,17 +452,132 @@ class AdaptiveLearner:
         rate = self.MAX_EXPLORATION_RATE * decay_factor
         return max(self.MIN_EXPLORATION_RATE, rate)
 
-    def _should_explore_uncertainty(self, prob_useful: float) -> bool:
-        """Determine if we should explore based on prediction uncertainty.
+    def _adaptive_exploration_rate(self) -> float:
+        """Calculate exploration rate blending sample decay with recent accuracy.
 
-        Explores more when predictions are uncertain (near 0.5).
-        This focuses exploration budget on edge cases rather than random images.
+        If classifier has been frequently wrong recently, increase exploration
+        to prevent premature convergence on bad predictions.
         """
-        base_rate = self._exploration_rate()
+        sample_rate = self._exploration_rate()
+
+        # Not enough recent predictions to assess accuracy
+        if len(self._recent_predictions) < 20:
+            return sample_rate
+
+        # Calculate error rate: how often predictions were wrong
+        # Error = predicted skip (p < 0.5) but was actually useful, or
+        #         predicted useful (p >= 0.5) but was actually useless
+        errors = sum(
+            1 for pred_prob, actual in self._recent_predictions
+            if (pred_prob < 0.5) == actual  # predicted skip but useful, or predicted keep but useless
+        )
+        error_rate = errors / len(self._recent_predictions)
+
+        # Boost exploration rate by up to 30% if accuracy is poor
+        # error_rate=0 -> no boost, error_rate=1 -> +30%
+        boosted_rate = sample_rate + error_rate * 0.30
+
+        return max(self.MIN_EXPLORATION_RATE, min(self.MAX_EXPLORATION_RATE, boosted_rate))
+
+    def _adaptive_skip_validation_rate(self) -> float:
+        """Calculate adaptive skip validation rate based on observed error rate.
+
+        If the classifier is frequently wrong on skip decisions (i.e., we're
+        skipping images that turn out to be useful), increase validation rate.
+        If skip accuracy is high, we can reduce validation overhead.
+        """
+        total = self._stats.get("skip_validation_ocrs", 0)
+        useful = self._stats.get("skip_validation_useful", 0)
+
+        # Not enough data - use default rate
+        if total < 20:
+            return self.SKIP_VALIDATION_RATE
+
+        error_rate = useful / total  # How often skips were wrong
+
+        # Target: 10% error rate on skips is acceptable
+        # If errors are high, validate more; if low, validate less
+        TARGET_ERROR_RATE = 0.10
+        adjustment = (error_rate / TARGET_ERROR_RATE) ** 0.5 if TARGET_ERROR_RATE > 0 else 1.0
+
+        # Clamp between 5% and 50%
+        return max(0.05, min(0.50, self.SKIP_VALIDATION_RATE * adjustment))
+
+    def _get_feature_region_key(self, features: ImageFeature) -> tuple[str, str, str]:
+        """Get a binning key for feature region tracking.
+
+        Bins images by size (small/medium/large), brightness (dark/medium/bright),
+        and page region (header/body/footer/margin).
+        """
+        # Size bins based on area
+        if features.area < 10000:
+            size_bin = "small"
+        elif features.area < 50000:
+            size_bin = "medium"
+        else:
+            size_bin = "large"
+
+        # Brightness bins
+        if features.brightness_mean < 100:
+            brightness_bin = "dark"
+        elif features.brightness_mean < 200:
+            brightness_bin = "medium"
+        else:
+            brightness_bin = "bright"
+
+        return (size_bin, brightness_bin, features.region)
+
+    def _ucb_bonus(self, features: ImageFeature) -> float:
+        """Calculate UCB1 exploration bonus for under-sampled feature regions.
+
+        Uses the UCB1 formula: sqrt(2 * ln(N) / n_i)
+        where N is total samples and n_i is samples in this region.
+
+        Returns a bonus (0 to 0.3) that increases exploration probability
+        for regions with few samples.
+        """
+        region_key = self._get_feature_region_key(features)
+        region_samples = self._region_sample_counts.get(region_key, 0)
+
+        # Maximum bonus for completely unexplored regions
+        if region_samples < 5:
+            return 0.30
+
+        # Not enough total samples for meaningful UCB calculation
+        if self._total_samples < 30:
+            return 0.15
+
+        # UCB1 formula with beta=2.0 for exploration emphasis
+        import math
+        beta = 2.0
+        ucb_value = math.sqrt(beta * math.log(self._total_samples) / region_samples)
+
+        # Clamp to [0, 0.3] range
+        return min(0.30, ucb_value)
+
+    def _should_explore_uncertainty(self, prob_useful: float, features: ImageFeature | None = None) -> bool:
+        """Determine if we should explore based on prediction uncertainty and UCB bonus.
+
+        Explores more when:
+        1. Predictions are uncertain (near 0.5)
+        2. Feature region is under-sampled (UCB bonus)
+
+        This focuses exploration budget on edge cases and unexplored regions
+        rather than random images.
+        """
+        base_rate = self._adaptive_exploration_rate()
+
         # Uncertainty is highest (1.0) when prob is 0.5, lowest (0.0) at 0 or 1
         uncertainty = 1 - abs(prob_useful - 0.5) * 2
-        # Scale exploration rate by uncertainty (4x multiplier for max uncertainty)
-        effective_rate = uncertainty * base_rate * 4
+
+        # Add UCB bonus for under-sampled regions
+        ucb_bonus = self._ucb_bonus(features) if features else 0.0
+
+        # Combine uncertainty-scaled rate with UCB bonus
+        # uncertainty * base_rate * 4 gives exploration for uncertain predictions
+        # ucb_bonus adds extra exploration for under-sampled regions
+        effective_rate = (uncertainty * base_rate * 4) + ucb_bonus
+
         return random.random() < effective_rate
 
     def should_ocr(self, features: ImageFeature) -> tuple[bool, str, bool]:
@@ -430,8 +615,8 @@ class AdaptiveLearner:
             feature_vector = np.array([features.to_vector()])
             prob_useful = self._classifier.predict_proba(feature_vector)[0][1]
 
-            # Uncertainty-based exploration: explore more on edge cases
-            if self._should_explore_uncertainty(prob_useful):
+            # Uncertainty-based exploration: explore more on edge cases and under-sampled regions
+            if self._should_explore_uncertainty(prob_useful, features):
                 self._stats["exploration_ocrs"] += 1
                 return True, f"uncertainty exploration (p={prob_useful:.0%})", True
 
@@ -439,9 +624,11 @@ class AdaptiveLearner:
             if prob_useful < self.SKIP_PROBABILITY_THRESHOLD:
                 # Force exploration of some "would skip" decisions to validate classifier
                 # This prevents the classifier from never learning when skips are wrong
-                if random.random() < self.SKIP_VALIDATION_RATE:
+                # Use adaptive rate: increase validation if skip errors are high
+                skip_validation_rate = self._adaptive_skip_validation_rate()
+                if random.random() < skip_validation_rate:
                     self._stats["skip_validation_ocrs"] += 1
-                    return True, f"skip-validation (p={prob_useful:.0%})", True
+                    return True, f"skip-validation (p={prob_useful:.0%}, rate={skip_validation_rate:.0%})", True
                 self._stats["images_skipped"] += 1
                 return False, f"classifier: {prob_useful:.0%} useful", False
 
@@ -542,6 +729,26 @@ class AdaptiveLearner:
                 else:
                     self._stats["exploration_empty"] += 1   # Confirms skipping is OK
 
+            # Track predictions for adaptive exploration rate
+            # Extract probability from reason if it's a classifier-based decision
+            # Reason formats: "classifier: X% useful", "skip-validation (p=X%...)", "uncertainty exploration (p=X%)"
+            pred_prob = None
+            if "classifier:" in reason:
+                # "classifier: 75% useful" -> 0.75
+                import re as reason_re
+                match = reason_re.search(r'(\d+)%', reason)
+                if match:
+                    pred_prob = int(match.group(1)) / 100.0
+            elif "p=" in reason:
+                # "skip-validation (p=12%...)" or "uncertainty exploration (p=48%)"
+                import re as reason_re
+                match = reason_re.search(r'p=(\d+)%', reason)
+                if match:
+                    pred_prob = int(match.group(1)) / 100.0
+
+            if pred_prob is not None:
+                self._recent_predictions.append((pred_prob, is_useful))
+
         # Insert outcome record
         self._conn.execute("""
             INSERT INTO ocr_outcomes (
@@ -565,6 +772,11 @@ class AdaptiveLearner:
         # Update sample count and potentially retrain classifier
         if ocr_performed:
             self._total_samples += 1
+
+            # Track region sample counts for UCB exploration bonus
+            region_key = self._get_feature_region_key(features)
+            self._region_sample_counts[region_key] += 1
+
             if self._total_samples >= self.MIN_SAMPLES_FOR_PREDICTION:
                 if (self._total_samples - self._last_train_count) >= self.RETRAIN_INTERVAL:
                     self._train_classifier()
@@ -687,12 +899,15 @@ class AdaptiveLearner:
         classifier_ready = self._classifier is not None
         current_exploration_rate = self._exploration_rate()
 
-        # Check if sklearn is available
+        # Check if sklearn is available and capture any import errors
+        sklearn_available = True
+        sklearn_error = None
         try:
             from sklearn.linear_model import LogisticRegression  # noqa
-            sklearn_available = True
-        except ImportError:
+            from sklearn.calibration import CalibratedClassifierCV  # noqa
+        except ImportError as e:
             sklearn_available = False
+            sklearn_error = str(e)
 
         # Quality tracking stats from database
         # Use thresholds from class constants
@@ -750,6 +965,7 @@ class AdaptiveLearner:
             "overall_useful_rate": useful_records / max(ocrd_records, 1),
             "classifier_ready": classifier_ready,
             "sklearn_available": sklearn_available,
+            "sklearn_error": sklearn_error,
             "training_samples": self._total_samples,
             "last_train_count": self._last_train_count,
             "exploration_rate": current_exploration_rate,
@@ -776,6 +992,8 @@ class AdaptiveLearner:
         self._classifier = None
         self._total_samples = 0
         self._last_train_count = 0
+        self._recent_predictions.clear()
+        self._region_sample_counts.clear()
         self._stats = {
             "images_seen": 0,
             "images_skipped": 0,
@@ -2936,11 +3154,20 @@ def print_learning_stats(stats: dict) -> None:
     # Classifier section
     print("  Classifier:")
     if not stats.get('sklearn_available', True):
-        print("    ✗ scikit-learn not installed (using heuristics)")
-        print("    Install with: pip install scikit-learn")
+        print("    ✗ scikit-learn not available (using heuristics)")
+        sklearn_error = stats.get('sklearn_error')
+        if sklearn_error:
+            print(f"    Error: {sklearn_error}")
+        else:
+            print("    Install with: pip install scikit-learn")
+        # Show Python environment for debugging
+        import sys
+        print(f"    Python: {sys.executable}")
     elif stats['classifier_ready']:
         print(f"    ✓ Trained on {stats['training_samples']:,} samples")
-        print(f"    Exploration rate: {stats['exploration_rate']:.1%} (uncertainty-based)")
+        print(f"    Exploration rate: {stats['exploration_rate']:.1%} (adaptive)")
+        # Show calibration status
+        print(f"    Last retrain at: {stats['last_train_count']:,} samples")
     else:
         needed = AdaptiveLearner.MIN_SAMPLES_FOR_PREDICTION - stats['training_samples']
         if needed > 0:
