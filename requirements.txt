@@ -2,9 +2,13 @@ pymupdf>=1.23.0
 paddlepaddle
 paddleocr
 pillow
+python-docx>=0.8.11
 
 # Optional: For adaptive learning (--learn)
 scikit-learn>=1.3
 
 # Optional: For higher accuracy OCR (requires GPU)
 # pip install surya-ocr
+
+# Optional: For .doc/.rtf/.odt support (converts via LibreOffice)
+# sudo apt install libreoffice-writer

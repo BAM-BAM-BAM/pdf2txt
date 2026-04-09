@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract text from PDFs and create corresponding markdown files."""
+"""Extract text from documents (PDF, DOCX, DOC, RTF, ODT) and create corresponding markdown files."""
 
 __version__ = "1.0.0"
 
@@ -18,6 +18,9 @@ from pathlib import Path
 
 # Use spawn to avoid terminal/curses issues with fork
 _mp_context = multiprocessing.get_context("spawn")
+
+# Supported document formats (case-insensitive matching)
+SUPPORTED_EXTENSIONS = {'.pdf', '.docx', '.doc', '.rtf', '.odt'}
 
 
 @dataclass
@@ -1193,7 +1196,7 @@ class ProcessingStats:
 @dataclass
 class FileResult:
     """Pickle-safe result object returned by worker processes."""
-    pdf_path: Path
+    source_path: Path
     success: bool
     message: str
     improve_detail: str | None = None
@@ -1374,7 +1377,7 @@ class RetroHUD:
                 y += 1
                 mb_processed = self.stats.processed_bytes / (1024 * 1024)
                 mb_total = self.stats.total_bytes / (1024 * 1024)
-                self.draw_stat(y, 2, "PDF IN: ", f"{mb_processed:>7.2f}/{mb_total:.2f} MB")
+                self.draw_stat(y, 2, "INPUT:  ", f"{mb_processed:>7.2f}/{mb_total:.2f} MB")
                 self.draw_stat(y, 36, "THROUGHPUT: ", f"{self.stats.mb_per_min():6.2f} MB/min")
 
                 # Stats row 3 - Output and compression
@@ -1519,6 +1522,55 @@ def find_pdfs(
             print(f"Found {len(result)} PDF file(s)", flush=True)
 
     return result
+
+
+def find_documents(
+    directory: Path,
+    recursive: bool = False,
+    quiet: bool = False,
+    shuffle: bool = False,
+    formats: set[str] | None = None,
+) -> list[Path]:
+    """Find all supported document files in directory (case-insensitive).
+
+    Args:
+        directory: Directory to search
+        recursive: Search subdirectories
+        quiet: Suppress output
+        shuffle: Randomize file order (useful for learning to avoid sequential bias)
+        formats: Set of extensions to search for (e.g., {'.pdf', '.docx'}). None = all supported.
+    """
+    extensions = formats if formats else SUPPORTED_EXTENSIONS
+
+    if not quiet:
+        mode = "recursively " if recursive else ""
+        fmt_list = ', '.join(ext.lstrip('.').upper() for ext in sorted(extensions))
+        print(f"Searching {mode}for documents ({fmt_list}) in: {directory}", flush=True)
+
+    docs = []
+    search = directory.rglob if recursive else directory.glob
+    for ext in extensions:
+        bare = ext.lstrip('.')
+        for pattern in [f'*.{bare.lower()}', f'*.{bare.upper()}', f'*.{bare.capitalize()}']:
+            docs.extend(search(pattern))
+
+    result = list(set(docs))
+
+    if shuffle:
+        random.shuffle(result)
+        if not quiet:
+            print(f"Found {len(result)} document(s) (shuffled for learning)", flush=True)
+    else:
+        if not quiet:
+            print(f"Found {len(result)} document(s)", flush=True)
+
+    return result
+
+
+def check_libreoffice_available() -> bool:
+    """Check if LibreOffice is available for .doc/.rtf/.odt conversion."""
+    import shutil
+    return shutil.which("libreoffice") is not None
 
 
 def check_tesseract_available() -> bool:
@@ -2465,12 +2517,154 @@ def extract_text_from_pdf(
     return pages
 
 
-def create_markdown(pdf_path: Path, pages: list[str]) -> str:
-    """Create markdown content from extracted pages."""
+def _paragraph_has_page_break(paragraph) -> bool:
+    """Check if a python-docx paragraph contains a page break."""
+    from docx.oxml.ns import qn
+    for run in paragraph.runs:
+        for br in run._element.findall(qn('w:br')):
+            if br.get(qn('w:type')) == 'page':
+                return True
+    return False
+
+
+def _heading_level(style_name: str) -> int:
+    """Extract heading level from a style name like 'Heading 1'."""
+    match = re.search(r'\d+', style_name)
+    return int(match.group()) if match else 1
+
+
+def _table_to_markdown(table) -> str:
+    """Convert a python-docx table to a markdown table."""
+    rows = []
+    for row in table.rows:
+        cells = [cell.text.strip().replace('|', '\\|') for cell in row.cells]
+        rows.append('| ' + ' | '.join(cells) + ' |')
+
+    if len(rows) >= 1:
+        # Add header separator after first row
+        col_count = len(table.rows[0].cells)
+        separator = '| ' + ' | '.join(['---'] * col_count) + ' |'
+        rows.insert(1, separator)
+
+    return '\n'.join(rows)
+
+
+def extract_text_from_docx(
+    doc_path: Path,
+    stats: ProcessingStats | None = None,
+) -> list[str]:
+    """Extract text from DOCX, returning list of section contents."""
+    import docx
+
+    document = docx.Document(doc_path)
+
+    # Build a unified list of content blocks (paragraphs and tables in order)
+    # by walking the document body XML
+    sections: list[str] = []
+    current_section: list[str] = []
+
+    for element in document.element.body:
+        from docx.oxml.ns import qn
+
+        if element.tag == qn('w:p'):
+            # It's a paragraph
+            from docx.text.paragraph import Paragraph
+            paragraph = Paragraph(element, document)
+
+            if _paragraph_has_page_break(paragraph) and current_section:
+                sections.append('\n'.join(current_section))
+                current_section = []
+
+            text = paragraph.text.strip()
+            if text:
+                if paragraph.style and paragraph.style.name and paragraph.style.name.startswith('Heading'):
+                    level = _heading_level(paragraph.style.name)
+                    text = '#' * level + ' ' + text
+                current_section.append(text)
+
+        elif element.tag == qn('w:tbl'):
+            # It's a table
+            from docx.table import Table
+            table = Table(element, document)
+            md_table = _table_to_markdown(table)
+            if md_table:
+                current_section.append('')
+                current_section.append(md_table)
+                current_section.append('')
+
+    if current_section:
+        sections.append('\n'.join(current_section))
+
+    if not sections:
+        sections = ['']
+
+    if stats:
+        stats.total_pages += len(sections)
+        stats.processed_pages += len(sections)
+
+    return sections
+
+
+def extract_text_via_libreoffice(
+    doc_path: Path,
+    stats: ProcessingStats | None = None,
+) -> list[str]:
+    """Extract text from .doc/.rtf/.odt by converting to .docx via LibreOffice."""
+    import subprocess
+    import tempfile
+
+    if not check_libreoffice_available():
+        raise RuntimeError(
+            f"LibreOffice is required to process {doc_path.suffix} files. "
+            "Install with: sudo apt install libreoffice-writer"
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = subprocess.run(
+            ['libreoffice', '--headless', '--convert-to', 'docx', '--outdir', tmpdir, str(doc_path)],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"LibreOffice conversion failed for {doc_path}: {result.stderr.decode()}")
+
+        converted = Path(tmpdir) / (doc_path.stem + '.docx')
+        if not converted.exists():
+            raise RuntimeError(f"LibreOffice conversion produced no output for {doc_path}")
+
+        return extract_text_from_docx(converted, stats=stats)
+
+
+def extract_text(
+    source_path: Path,
+    use_ocr: bool = True,
+    ocr_engine: str = "paddle",
+    force_ocr: bool = False,
+    stats: ProcessingStats | None = None,
+    hud: RetroHUD | None = None,
+    learner: AdaptiveLearner | None = None,
+) -> list[str]:
+    """Extract text from any supported document format."""
+    ext = source_path.suffix.lower()
+
+    if ext == '.pdf':
+        return extract_text_from_pdf(
+            source_path, use_ocr=use_ocr, ocr_engine=ocr_engine,
+            force_ocr=force_ocr, stats=stats, hud=hud, learner=learner,
+        )
+    elif ext == '.docx':
+        return extract_text_from_docx(source_path, stats=stats)
+    elif ext in ('.doc', '.rtf', '.odt'):
+        return extract_text_via_libreoffice(source_path, stats=stats)
+    else:
+        raise ValueError(f"Unsupported format: {ext}")
+
+
+def create_markdown(source_path: Path, pages: list[str], page_label: str = "Page") -> str:
+    """Create markdown content from extracted text sections."""
     lines = [
-        f"# {pdf_path.stem}",
+        f"# {source_path.stem}",
         "",
-        f"> Source: {pdf_path}",
+        f"> Source: {source_path}",
         "",
         "---",
         "",
@@ -2478,14 +2672,14 @@ def create_markdown(pdf_path: Path, pages: list[str]) -> str:
 
     for i, page_text in enumerate(pages, start=1):
         if i > 1:
-            lines.extend(["", "---", f"*Page {i}*", ""])
+            lines.extend(["", "---", f"*{page_label} {i}*", ""])
         lines.append(page_text)
 
     return '\n'.join(lines)
 
 
-def process_pdf(
-    pdf_path: Path,
+def process_document(
+    source_path: Path,
     overwrite: bool,
     dry_run: bool,
     use_ocr: bool = True,
@@ -2496,12 +2690,13 @@ def process_pdf(
     hud: RetroHUD | None = None,
     learner: AdaptiveLearner | None = None,
 ) -> tuple[bool, str, str | None]:
-    """Process a single PDF file.
+    """Process a single document file.
 
     Returns: (success, message, improve_detail)
     - improve_detail is set when improve mode makes a decision
     """
-    md_path = pdf_path.with_suffix('.md')
+    md_path = source_path.with_suffix('.md')
+    page_label = "Page" if source_path.suffix.lower() == '.pdf' else "Section"
 
     # Improve mode: always extract and compare
     if improve and md_path.exists():
@@ -2510,11 +2705,11 @@ def process_pdf(
 
         try:
             # Extract new version
-            pages = extract_text_from_pdf(
-                pdf_path, use_ocr=use_ocr, ocr_engine=ocr_engine,
-                force_ocr=force_ocr, stats=stats, hud=hud, learner=learner
+            pages = extract_text(
+                source_path, use_ocr=use_ocr, ocr_engine=ocr_engine,
+                force_ocr=force_ocr, stats=stats, hud=hud, learner=learner,
             )
-            new_markdown = create_markdown(pdf_path, pages)
+            new_markdown = create_markdown(source_path, pages, page_label=page_label)
             new_text = '\n'.join(pages)
 
             # Read and strip existing
@@ -2535,31 +2730,35 @@ def process_pdf(
                 if stats:
                     stats.md_bytes += md_path.stat().st_size
                 detail = f"Kept existing: {old_metrics.total_score:.2f} > {new_metrics.total_score:.2f}"
-                return False, f"Kept (better quality): {pdf_path.name}", detail
+                return False, f"Kept (better quality): {source_path.name}", detail
 
         except Exception as e:
-            return False, f"FAILED: {pdf_path.name} - {e}", None
+            return False, f"FAILED: {source_path.name} - {e}", None
 
     # Standard mode: skip existing unless overwrite
     if md_path.exists() and not overwrite:
-        return False, f"Skipped (exists): {pdf_path.name}", None
+        return False, f"Skipped (exists): {source_path.name}", None
 
     if dry_run:
         action = "Would overwrite" if md_path.exists() else "Would create"
         return True, f"{action}: {md_path.name}", None
 
     try:
-        pages = extract_text_from_pdf(
-            pdf_path, use_ocr=use_ocr, ocr_engine=ocr_engine,
-            force_ocr=force_ocr, stats=stats, hud=hud, learner=learner
+        pages = extract_text(
+            source_path, use_ocr=use_ocr, ocr_engine=ocr_engine,
+            force_ocr=force_ocr, stats=stats, hud=hud, learner=learner,
         )
-        markdown_content = create_markdown(pdf_path, pages)
+        markdown_content = create_markdown(source_path, pages, page_label=page_label)
         md_path.write_text(markdown_content, encoding='utf-8')
         if stats:
             stats.md_bytes += len(markdown_content.encode('utf-8'))
         return True, f"Created: {md_path.name}", None
     except Exception as e:
-        return False, f"FAILED: {pdf_path.name} - {e}", None
+        return False, f"FAILED: {source_path.name} - {e}", None
+
+
+# Backward compatibility alias
+process_pdf = process_document
 
 
 def _worker_init_suppress_output():
@@ -2574,8 +2773,8 @@ def _worker_init_suppress_output():
     os.close(devnull_fd)
 
 
-def process_pdf_worker(
-    pdf_path: Path,
+def process_document_worker(
+    source_path: Path,
     overwrite: bool,
     dry_run: bool,
     use_ocr: bool,
@@ -2583,14 +2782,14 @@ def process_pdf_worker(
     force_ocr: bool,
     improve: bool
 ) -> FileResult:
-    """Process a single PDF in a separate process. Returns FileResult for aggregation."""
-    import pymupdf
-
-    md_path = pdf_path.with_suffix('.md')
-    file_size = pdf_path.stat().st_size
+    """Process a single document in a separate process. Returns FileResult for aggregation."""
+    md_path = source_path.with_suffix('.md')
+    file_size = source_path.stat().st_size
+    is_pdf = source_path.suffix.lower() == '.pdf'
+    page_label = "Page" if is_pdf else "Section"
 
     result = FileResult(
-        pdf_path=pdf_path,
+        source_path=source_path,
         success=False,
         message="",
         processed_bytes=file_size
@@ -2599,36 +2798,41 @@ def process_pdf_worker(
     log_msgs = []
 
     def extract_pages() -> tuple[list[str], int, int]:
-        """Extract text from all pages, returning (pages, ocr_pages, ocr_chars)."""
-        doc = pymupdf.open(pdf_path)
+        """Extract text, returning (pages, ocr_pages, ocr_chars)."""
+        if is_pdf:
+            import pymupdf
+            doc = pymupdf.open(source_path)
 
-        # Resolve OCR engine with fallbacks
-        ocr_available, active_engine, engine_logs = resolve_ocr_engine(ocr_engine, use_ocr)
-        log_msgs.extend(engine_logs)
+            ocr_available, active_engine, engine_logs = resolve_ocr_engine(ocr_engine, use_ocr)
+            log_msgs.extend(engine_logs)
 
-        pages = []
-        ocr_pages_count = 0
-        ocr_chars_count = 0
-        total_pages = len(doc)
+            pages = []
+            ocr_pages_count = 0
+            ocr_chars_count = 0
+            total_pages = len(doc)
 
-        try:
-            for page_num, page in enumerate(doc, start=1):
-                engine = active_engine if ocr_available else "none"
-                text, used_ocr, ocr_chars, log_msg = extract_page_text(
-                    page, engine, force_ocr, suppress_output=False
-                )
+            try:
+                for page_num, page in enumerate(doc, start=1):
+                    engine = active_engine if ocr_available else "none"
+                    text, used_ocr, ocr_chars, log_msg = extract_page_text(
+                        page, engine, force_ocr, suppress_output=False
+                    )
 
-                if used_ocr:
-                    ocr_pages_count += 1
-                    ocr_chars_count += ocr_chars
-                if log_msg:
-                    log_msgs.append(f"  p{page_num}/{total_pages}: {log_msg}")
+                    if used_ocr:
+                        ocr_pages_count += 1
+                        ocr_chars_count += ocr_chars
+                    if log_msg:
+                        log_msgs.append(f"  p{page_num}/{total_pages}: {log_msg}")
 
-                pages.append(text)
-        finally:
-            doc.close()
+                    pages.append(text)
+            finally:
+                doc.close()
 
-        return pages, ocr_pages_count, ocr_chars_count
+            return pages, ocr_pages_count, ocr_chars_count
+        else:
+            # Non-PDF: use the format dispatcher (no OCR)
+            pages = extract_text(source_path)
+            return pages, 0, 0
 
     # Improve mode: always extract and compare
     if improve and md_path.exists():
@@ -2639,7 +2843,7 @@ def process_pdf_worker(
 
         try:
             pages, ocr_pages_count, ocr_chars_count = extract_pages()
-            new_markdown = create_markdown(pdf_path, pages)
+            new_markdown = create_markdown(source_path, pages, page_label=page_label)
             new_text = '\n'.join(pages)
 
             existing_markdown = md_path.read_text(encoding='utf-8')
@@ -2663,21 +2867,21 @@ def process_pdf_worker(
                 result.md_bytes = md_path.stat().st_size
                 result.success = False
                 result.was_kept = True
-                result.message = f"Kept (better quality): {pdf_path.name}"
+                result.message = f"Kept (better quality): {source_path.name}"
                 result.improve_detail = f"Kept existing: {old_metrics.total_score:.2f} > {new_metrics.total_score:.2f}"
 
             return result
 
         except Exception as e:
             result.was_failed = True
-            result.message = f"FAILED: {pdf_path.name} - {e}"
+            result.message = f"FAILED: {source_path.name} - {e}"
             result.log_messages = log_msgs
             return result
 
     # Standard mode: skip existing unless overwrite
     if md_path.exists() and not overwrite:
         result.was_skipped = True
-        result.message = f"Skipped (exists): {pdf_path.name}"
+        result.message = f"Skipped (exists): {source_path.name}"
         result.processed_bytes = 0  # Didn't process
         return result
 
@@ -2689,7 +2893,7 @@ def process_pdf_worker(
 
     try:
         pages, ocr_pages_count, ocr_chars_count = extract_pages()
-        markdown_content = create_markdown(pdf_path, pages)
+        markdown_content = create_markdown(source_path, pages, page_label=page_label)
         md_path.write_text(markdown_content, encoding='utf-8')
 
         result.md_bytes = len(markdown_content.encode('utf-8'))
@@ -2703,9 +2907,13 @@ def process_pdf_worker(
 
     except Exception as e:
         result.was_failed = True
-        result.message = f"FAILED: {pdf_path.name} - {e}"
+        result.message = f"FAILED: {source_path.name} - {e}"
         result.log_messages = log_msgs
         return result
+
+
+# Backward compatibility alias
+process_pdf_worker = process_document_worker
 
 
 def aggregate_result(stats: ProcessingStats, result: FileResult, improve_mode: bool):
@@ -2732,11 +2940,11 @@ def aggregate_result(stats: ProcessingStats, result: FileResult, improve_mode: b
         stats.processed_bytes += result.processed_bytes
 
 
-def run_simple_parallel(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, force_ocr: bool, max_workers: int) -> int:
+def run_simple_parallel(documents: list[Path], args, use_ocr: bool, ocr_engine: str, force_ocr: bool, max_workers: int) -> int:
     """Run processing with simple text output using parallel workers."""
     stats = ProcessingStats()
-    stats.total_files = len(pdfs)
-    stats.total_bytes = sum(p.stat().st_size for p in pdfs)
+    stats.total_files = len(documents)
+    stats.total_bytes = sum(p.stat().st_size for p in documents)
     improve_mode = getattr(args, 'improve', False)
 
     if args.verbose or args.dry_run:
@@ -2751,15 +2959,15 @@ def run_simple_parallel(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, 
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=_mp_context) as executor:
         futures = {
             executor.submit(
-                process_pdf_worker,
-                pdf_path,
+                process_document_worker,
+                doc_path,
                 args.overwrite,
                 args.dry_run,
                 use_ocr,
                 ocr_engine,
                 force_ocr,
                 improve_mode
-            ): pdf_path for pdf_path in sorted(pdfs)
+            ): doc_path for doc_path in sorted(documents)
         }
 
         for future in as_completed(futures):
@@ -2794,7 +3002,7 @@ def run_simple_parallel(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, 
             print(f"Stats:")
             print(f"  Time elapsed:    {elapsed:.1f}s")
             print(f"  Workers used:    {max_workers}")
-            print(f"  PDF input:       {total_mb:.2f} MB ({stats.processed_pages} pages)")
+            print(f"  Input:           {total_mb:.2f} MB ({stats.processed_pages} pages)")
             print(f"  MD output:       {md_mb:.2f} MB ({ratio:.1f}% of input)")
             print(f"  Processing rate: {files_per_min:.1f} files/min, {mb_per_min:.2f} MB/min")
             print(f"  OCR stats:       {stats.ocr_pages} pages, {stats.ocr_chars:,} chars extracted")
@@ -2802,11 +3010,11 @@ def run_simple_parallel(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, 
     return 1 if stats.failed_files > 0 else 0
 
 
-def run_with_hud_parallel(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str, force_ocr: bool, max_workers: int) -> int:
+def run_with_hud_parallel(documents: list[Path], args, use_ocr: bool, ocr_engine: str, force_ocr: bool, max_workers: int) -> int:
     """Run processing with the retro HUD using parallel workers."""
     stats = ProcessingStats()
-    stats.total_files = len(pdfs)
-    stats.total_bytes = sum(p.stat().st_size for p in pdfs)
+    stats.total_files = len(documents)
+    stats.total_bytes = sum(p.stat().st_size for p in documents)
     improve_mode = getattr(args, 'improve', False)
 
     # Create executor BEFORE curses to avoid any startup output interfering
@@ -2820,15 +3028,15 @@ def run_with_hud_parallel(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str
     # Submit all tasks before entering curses
     futures = {
         executor.submit(
-            process_pdf_worker,
-            pdf_path,
+            process_document_worker,
+            doc_path,
             args.overwrite,
             args.dry_run,
             use_ocr,
             ocr_engine,
             force_ocr,
             improve_mode
-        ): pdf_path for pdf_path in sorted(pdfs)
+        ): doc_path for doc_path in sorted(documents)
     }
 
     try:
@@ -2845,7 +3053,7 @@ def run_with_hud_parallel(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str
 
                 aggregate_result(stats, result, improve_mode)
 
-                stats.current_file = str(result.pdf_path)
+                stats.current_file = str(result.source_path)
                 stats.current_status = f"Workers: {active_count} active | {stats.processed_files + stats.skipped_files + stats.failed_files}/{stats.total_files} done"
                 stats.log(f"  → {result.message}")
                 if result.improve_detail:
@@ -2879,7 +3087,7 @@ def run_with_hud_parallel(pdfs: list[Path], args, use_ocr: bool, ocr_engine: str
 
 
 def run_with_hud(
-    pdfs: list[Path],
+    documents: list[Path],
     args,
     use_ocr: bool,
     ocr_engine: str,
@@ -2888,31 +3096,31 @@ def run_with_hud(
 ) -> int:
     """Run processing with the retro HUD."""
     stats = ProcessingStats()
-    stats.total_files = len(pdfs)
-    stats.total_bytes = sum(p.stat().st_size for p in pdfs)
+    stats.total_files = len(documents)
+    stats.total_bytes = sum(p.stat().st_size for p in documents)
     improve_mode = getattr(args, 'improve', False)
 
     with RetroHUD(stats, learner=learner) as hud:
         hud.refresh()
 
-        for pdf_path in sorted(pdfs):
-            stats.current_file = str(pdf_path)
+        for doc_path in sorted(documents):
+            stats.current_file = str(doc_path)
             stats.current_page = 0
             stats.current_file_pages = 0
-            file_size = pdf_path.stat().st_size
+            file_size = doc_path.stat().st_size
 
             # Skip files already processed when learning is enabled (deduplication)
-            if learner and learner.enabled and learner.is_file_processed(pdf_path):
-                stats.log(f"Skipping (already learned): {pdf_path.name}")
+            if learner and learner.enabled and learner.is_file_processed(doc_path):
+                stats.log(f"Skipping (already learned): {doc_path.name}")
                 stats.skipped_files += 1
                 hud.refresh()
                 continue
 
-            stats.log(f"Processing: {pdf_path.name}")
+            stats.log(f"Processing: {doc_path.name}")
             hud.refresh()
 
-            success, message, improve_detail = process_pdf(
-                pdf_path,
+            success, message, improve_detail = process_document(
+                doc_path,
                 overwrite=args.overwrite,
                 dry_run=args.dry_run,
                 use_ocr=use_ocr,
@@ -2974,7 +3182,7 @@ def run_with_hud(
 
 
 def run_simple(
-    pdfs: list[Path],
+    documents: list[Path],
     args,
     use_ocr: bool,
     ocr_engine: str,
@@ -2983,8 +3191,8 @@ def run_simple(
 ) -> int:
     """Run processing with simple text output."""
     stats = ProcessingStats()
-    stats.total_files = len(pdfs)
-    stats.total_bytes = sum(p.stat().st_size for p in pdfs)
+    stats.total_files = len(documents)
+    stats.total_bytes = sum(p.stat().st_size for p in documents)
     improve_mode = getattr(args, 'improve', False)
 
     if args.verbose or args.dry_run:
@@ -2997,21 +3205,21 @@ def run_simple(
         print(f"OCR engine: {ocr_engine}")
         print()
 
-    for pdf_path in sorted(pdfs):
+    for doc_path in sorted(documents):
         # Skip files already processed when learning is enabled (deduplication)
-        if learner and learner.enabled and learner.is_file_processed(pdf_path):
+        if learner and learner.enabled and learner.is_file_processed(doc_path):
             if args.verbose:
-                print(f"Skipping (already learned): {pdf_path}")
+                print(f"Skipping (already learned): {doc_path}")
             stats.skipped_files += 1
             continue
 
         if args.verbose:
-            print(f"Processing: {pdf_path}")
+            print(f"Processing: {doc_path}")
 
-        file_size = pdf_path.stat().st_size
+        file_size = doc_path.stat().st_size
 
-        success, message, improve_detail = process_pdf(
-            pdf_path,
+        success, message, improve_detail = process_document(
+            doc_path,
             overwrite=args.overwrite,
             dry_run=args.dry_run,
             use_ocr=use_ocr,
@@ -3066,7 +3274,7 @@ def run_simple(
             print()
             print(f"Stats:")
             print(f"  Time elapsed:    {elapsed:.1f}s")
-            print(f"  PDF input:       {total_mb:.2f} MB ({stats.processed_pages} pages)")
+            print(f"  Input:           {total_mb:.2f} MB ({stats.processed_pages} pages)")
             print(f"  MD output:       {md_mb:.2f} MB ({ratio:.1f}% of input)")
             print(f"  Processing rate: {files_per_min:.1f} files/min, {mb_per_min:.2f} MB/min")
             print(f"  OCR stats:       {stats.ocr_pages} pages, {stats.ocr_chars:,} chars extracted")
@@ -3200,7 +3408,7 @@ def print_learning_stats(stats: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Extract text from PDFs and create markdown files alongside each PDF."
+        description="Extract text from documents (PDF, DOCX, DOC, RTF, ODT) and create markdown files."
     )
     parser.add_argument(
         "--version",
@@ -3209,7 +3417,7 @@ def main() -> int:
     )
     parser.add_argument(
         "directory",
-        help="Directory to search for PDFs (supports Windows paths in WSL)"
+        help="Directory to search for documents (supports Windows paths in WSL)"
     )
 
     verbosity = parser.add_mutually_exclusive_group()
@@ -3248,7 +3456,14 @@ def main() -> int:
     parser.add_argument(
         "-r", "--recursive",
         action="store_true",
-        help="Search for PDFs recursively in subdirectories"
+        help="Search for documents recursively in subdirectories"
+    )
+    parser.add_argument(
+        "--formats",
+        type=str,
+        default=None,
+        metavar="FORMATS",
+        help="Comma-separated formats to process (pdf,docx,doc,rtf,odt). Default: all supported"
     )
     parser.add_argument(
         "--no-ocr",
@@ -3412,7 +3627,17 @@ def main() -> int:
                 print("Install with: pip install paddleocr paddlepaddle", file=sys.stderr)
             use_ocr = False
 
-    # Find PDFs
+    # Find documents
+    # Parse --formats flag
+    formats = None
+    if args.formats:
+        formats = {f'.{f.strip().lower().lstrip(".")}' for f in args.formats.split(',')}
+        unsupported = formats - SUPPORTED_EXTENSIONS
+        if unsupported:
+            print(f"Error: Unsupported format(s): {', '.join(unsupported)}", file=sys.stderr)
+            print(f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}", file=sys.stderr)
+            return 1
+
     # Determine shuffle: default ON with --learn, unless --no-learn-shuffle
     should_shuffle = False
     if args.learn:
@@ -3420,21 +3645,23 @@ def main() -> int:
     if args.learn_shuffle:
         should_shuffle = True  # Explicit --learn-shuffle overrides
 
-    pdfs = find_pdfs(
+    documents = find_documents(
         directory,
         recursive=args.recursive,
         quiet=args.quiet,
         shuffle=should_shuffle,
+        formats=formats,
     )
 
-    if not pdfs:
+    if not documents:
         return 0
 
     # Determine worker count
     # OCR is memory-intensive (each worker loads 1-2GB+ ML models), so limit parallelism
-    # Non-OCR extraction is lightweight and can use more workers
+    # Non-PDF extraction is lightweight and can use more workers
     cpu_count = os.cpu_count() or 4
-    if use_ocr:
+    has_pdfs = any(d.suffix.lower() == '.pdf' for d in documents)
+    if use_ocr and has_pdfs:
         # OCR is memory-intensive; Surya loads large GPU models per worker
         if ocr_engine == "surya":
             # Surya requires ~4GB VRAM per worker; use single worker to avoid OOM
@@ -3443,7 +3670,7 @@ def main() -> int:
             # PaddleOCR/Tesseract: max 2 workers to avoid memory exhaustion
             default_workers = min(2, cpu_count - 1)
     else:
-        # Text-only extraction can safely use more parallelism
+        # Non-PDF or text-only extraction can safely use more parallelism
         default_workers = max(cpu_count - 1, 1)
     max_workers = args.jobs if args.jobs is not None else default_workers
     max_workers = max(1, max_workers)  # Ensure at least 1
@@ -3470,15 +3697,15 @@ def main() -> int:
         if max_workers == 1:
             # Sequential processing (original behavior)
             if args.hud and not args.dry_run:
-                result = run_with_hud(pdfs, args, use_ocr, ocr_engine, force_ocr, learner=learner)
+                result = run_with_hud(documents, args, use_ocr, ocr_engine, force_ocr, learner=learner)
             else:
-                result = run_simple(pdfs, args, use_ocr, ocr_engine, force_ocr, learner=learner)
+                result = run_simple(documents, args, use_ocr, ocr_engine, force_ocr, learner=learner)
         else:
             # Parallel processing (no learner support)
             if args.hud and not args.dry_run:
-                result = run_with_hud_parallel(pdfs, args, use_ocr, ocr_engine, force_ocr, max_workers)
+                result = run_with_hud_parallel(documents, args, use_ocr, ocr_engine, force_ocr, max_workers)
             else:
-                result = run_simple_parallel(pdfs, args, use_ocr, ocr_engine, force_ocr, max_workers)
+                result = run_simple_parallel(documents, args, use_ocr, ocr_engine, force_ocr, max_workers)
 
         # Show detailed stats if --learn-stats was requested with --learn
         if args.learn_stats and learner:
