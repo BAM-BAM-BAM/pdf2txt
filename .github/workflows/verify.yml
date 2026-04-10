@@ -1,0 +1,33 @@
+name: Verify
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install pymupdf python-docx scikit-learn pillow pytest ruff
+      - name: Lint
+        run: ruff check pdf2txt.py tests/ --select E,F,W --ignore E501
+      - name: Run tests
+        run: python -m pytest tests/ -v
+      - name: Verify import
+        run: python -c "from pdf2txt import SUPPORTED_EXTENSIONS; print(f'{len(SUPPORTED_EXTENSIONS)} formats supported')"
+
+  fgt-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Clone FGT config
+        run: git clone --depth 1 https://github.com/BAM-BAM-BAM/fgt-config /tmp/fgt
+      - name: Validate FGT structure
+        run: node /tmp/fgt/scripts/validate-fgt.mjs --project .
+      - name: Check for cargo-culted content
+        run: node /tmp/fgt/scripts/validate-templates.mjs --project . --domain PDF
