@@ -9,25 +9,29 @@ If it's not in this file, it doesn't exist.
 ## Open
 
 ### Architecture
-- [ ] Modularize pdf2txt.py (3,496 lines) into separate modules: cli, extractors/, ocr/, learning/, quality, hud, models -- source: CP-002 (Monolith Accumulation), LEARNINGS_FOR_EVENT_APP.md
-- [ ] Extract AdaptiveLearner into its own module -- source: architecture review
-- [ ] Extract TextQualityScorer to quality.py -- source: architecture review
-- [ ] Extract HUD/curses display to hud.py -- source: architecture review
-
-### Testing
-- [ ] Add QUAL-* tests for extraction output quality (known PDF -> expected text) -- source: CP-008
-- [ ] Add INV-001 test: every SUPPORTED_EXTENSIONS entry has a handler in extract_text() -- source: FGT methodology
-- [ ] Add INV-003 test: ImageFeature.to_vector() returns exactly 14 elements -- source: BUG-002
-- [ ] Add BOUND-001 test: OCR gracefully falls back to CPU when GPU unavailable -- source: BUG-003
-- [ ] Add PRO-* test for module size enforcement (flag files >500 lines after modularization) -- source: CP-002
-- [ ] Rename existing tests to use FGT category prefixes (INV-/QUAL-/BOUND-/etc.) -- source: FGT methodology
+- [ ] Further split pdf2txt.py (2,278 lines) into extractors.py + ocr.py + cli.py -- source: PATTERNS_PDF.md target structure
 
 ### Documentation
 - [ ] Expand FGT_DOMAIN_PDF.md with additional bug patterns as discovered -- source: FGT methodology
 
-### Infrastructure
-- [ ] Add GitHub Actions CI workflow -- source: CP-012
-- [ ] Configure Claude Code hooks for FGT enforcement -- source: CP-012
-- [ ] Set up branch protection on main -- source: CP-012
-
 ## Resolved
+
+### Architecture (2026-04-10)
+- [x] Modularize pdf2txt.py into separate modules -- split to pdf2txt_models.py (175), pdf2txt_quality.py (130), pdf2txt_learning.py (904), pdf2txt_hud.py (274), pdf2txt.py (2,278)
+- [x] Extract AdaptiveLearner into its own module -- pdf2txt_learning.py
+- [x] Extract TextQualityScorer to quality.py -- pdf2txt_quality.py
+- [x] Extract HUD/curses display to hud.py -- pdf2txt_hud.py
+
+### Testing (2026-04-10)
+- [x] Add QUAL-001 test for extraction output quality -- test_fgt_categories.py
+- [x] Add INV-001 test: all extensions have handlers -- test_fgt_categories.py
+- [x] Add INV-003 test: feature vector dimension = 14 -- test_fgt_categories.py
+- [x] Add BOUND-001 through BOUND-004 tests -- test_fgt_categories.py
+- [x] Add PRO-001 test for module size enforcement -- test_fgt_categories.py
+- [x] Add PRO-002 test for hardcoded extension detection -- test_fgt_categories.py
+- [x] Rename existing 56 tests to FGT category prefixes -- test_adaptive_learner.py, test_document_formats.py
+
+### Infrastructure (2026-04-10)
+- [x] Add GitHub Actions CI workflow (test + lint + FGT validation) -- .github/workflows/verify.yml
+- [x] Configure Claude Code hooks for FGT enforcement -- scripts/fgt_stop_check.sh
+- [x] Set up branch protection on main (test + fgt-validation required) -- via gh api
